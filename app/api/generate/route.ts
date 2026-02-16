@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import path from "node:path";
 import { NextResponse } from "next/server";
 import sharp from "sharp";
 import { getEnv } from "@/lib/env";
@@ -255,7 +256,10 @@ async function buildFigmaRenderPng(inputPhoto: Buffer, title: string, fileKey: s
     tpl.layout.photo.radii
   );
 
-  const fontPath = join(process.cwd(), "assets", "fonts", "gothampro", "gothampro_bold.ttf");
+  const fontPath = path.join(process.cwd(), "assets", "fonts", "gothampro", "gothampro_bold.ttf");
+  if (!existsSync(fontPath)) {
+    throw new Error(`Font file not found: ${fontPath}`);
+  }
   const font = await loadFontCached(fontPath);
   const metrics = getFontMetricsPx(font, fontSize);
   const lines = wrapTextByWords(title, maxTextWidth, font, fontSize, letterSpacing);

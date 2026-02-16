@@ -1,5 +1,6 @@
 import {
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
   type PutObjectCommandInput
@@ -44,6 +45,17 @@ export async function getObject(key: string) {
   const s3 = getS3Client();
   return s3.send(
     new GetObjectCommand({
+      Bucket: env.B2_BUCKET_NAME,
+      Key: key
+    })
+  );
+}
+
+export async function headObject(key: string) {
+  const env = getEnv();
+  const s3 = getS3Client();
+  return s3.send(
+    new HeadObjectCommand({
       Bucket: env.B2_BUCKET_NAME,
       Key: key
     })

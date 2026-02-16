@@ -1,6 +1,7 @@
 type RuntimeEnv = {
   FIGMA_TOKEN?: string;
   FIGMA_FILE_KEY?: string;
+  USE_FIGMA_RENDER?: string;
   B2_BUCKET_NAME: string;
   B2_S3_REGION: string;
   B2_S3_ENDPOINT: string;
@@ -40,6 +41,7 @@ export function getEnv(): RuntimeEnv {
   cachedEnv = {
     FIGMA_TOKEN: process.env.FIGMA_TOKEN,
     FIGMA_FILE_KEY: process.env.FIGMA_FILE_KEY,
+    USE_FIGMA_RENDER: process.env.USE_FIGMA_RENDER,
     B2_BUCKET_NAME: getRequiredEnv("B2_BUCKET_NAME"),
     B2_S3_REGION: getRequiredEnv("B2_S3_REGION"),
     B2_S3_ENDPOINT: getRequiredEnv("B2_S3_ENDPOINT"),
@@ -58,4 +60,8 @@ export function getFigmaEnv() {
     FIGMA_TOKEN: env.FIGMA_TOKEN ?? getRequiredEnv("FIGMA_TOKEN"),
     FIGMA_FILE_KEY: env.FIGMA_FILE_KEY ?? getRequiredEnv("FIGMA_FILE_KEY")
   };
+}
+
+export function isFigmaRenderEnabled(): boolean {
+  return getEnv().USE_FIGMA_RENDER === "1";
 }

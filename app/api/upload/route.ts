@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
-import { env } from "@/lib/env";
+import { getEnv } from "@/lib/env";
 import { getSignedGetUrl, putObject } from "@/lib/s3";
 
 export const runtime = "nodejs";
@@ -22,6 +22,7 @@ function extFromMime(mimeType: string): string {
 
 export async function POST(request: Request) {
   try {
+    const env = getEnv();
     const formData = await request.formData();
     const file = formData.get("file");
 

@@ -5,20 +5,33 @@ import {
   type PutObjectCommandInput
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { env } from "@/lib/env";
+import { getEnv } from "@/lib/env";
 
-export const s3Client = new S3Client({
-  endpoint: env.B2_S3_ENDPOINT,
-  region: env.B2_S3_REGION,
-  credentials: {
-    accessKeyId: env.B2_ACCESS_KEY_ID,
-    secretAccessKey: env.B2_SECRET_ACCESS_KEY
-  },
-  forcePathStyle: true
-});
+let s3Client: S3Client | null = null;
+
+export function getS3Client(): S3Client {
+  if (s3Client) {
+    return s3Client;
+  }
+
+  const env = getEnv();
+  s3Client = new S3Client({
+    endpoint: env.B2_S3_ENDPOINT,
+    region: env.B2_S3_REGION,
+    credentials: {
+      accessKeyId: env.B2_ACCESS_KEY_ID,
+      secretAccessKey: env.B2_SECRET_ACCESS_KEY
+    },
+    forcePathStyle: true
+  });
+
+  return s3Client;
+}
 
 export async function putObject(input: Omit<PutObjectCommandInput, "Bucket">) {
-  return s3Client.send(
+  const env = getEnv();
+  const s3 = getS3Client();
+  return s3.send(
     new PutObjectCommand({
       Bucket: env.B2_BUCKET_NAME,
       ...input
@@ -27,7 +40,9 @@ export async function putObject(input: Omit<PutObjectCommandInput, "Bucket">) {
 }
 
 export async function getObject(key: string) {
-  return s3Client.send(
+  const env = getEnv();
+  const s3 = getS3Client();
+  return s3.send(
     new GetObjectCommand({
       Bucket: env.B2_BUCKET_NAME,
       Key: key
@@ -36,11 +51,13 @@ export async function getObject(key: string) {
 }
 
 export async function getSignedGetUrl(key: string) {
+  const env = getEnv();
+  const s3 = getS3Client();
   const command = new GetObjectCommand({
     Bucket: env.B2_BUCKET_NAME,
     Key: key
   });
-  return getSignedUrl(s3Client, command, {
+  return getSignedUrl(s3, command, {
     expiresIn: env.SIGNED_URL_EXPIRES_SEC
   });
 }

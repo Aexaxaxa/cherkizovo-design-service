@@ -10,6 +10,8 @@ type RuntimeEnv = {
   SIGNED_URL_EXPIRES_SEC: number;
 };
 
+let cachedEnv: RuntimeEnv | null = null;
+
 function getRequiredEnv(name: string): string {
   const value = process.env[name];
   if (!value || value.trim().length === 0) {
@@ -30,21 +32,30 @@ function getNumberEnv(name: string, fallback: number): number {
   return value;
 }
 
-export const env: RuntimeEnv = {
-  FIGMA_TOKEN: process.env.FIGMA_TOKEN,
-  FIGMA_FILE_KEY: process.env.FIGMA_FILE_KEY,
-  B2_BUCKET_NAME: getRequiredEnv("B2_BUCKET_NAME"),
-  B2_S3_REGION: getRequiredEnv("B2_S3_REGION"),
-  B2_S3_ENDPOINT: getRequiredEnv("B2_S3_ENDPOINT"),
-  B2_ACCESS_KEY_ID: getRequiredEnv("B2_ACCESS_KEY_ID"),
-  B2_SECRET_ACCESS_KEY: getRequiredEnv("B2_SECRET_ACCESS_KEY"),
-  MAX_UPLOAD_MB: getNumberEnv("MAX_UPLOAD_MB", 10),
-  SIGNED_URL_EXPIRES_SEC: getNumberEnv("SIGNED_URL_EXPIRES_SEC", 900)
-};
+export function getEnv(): RuntimeEnv {
+  if (cachedEnv) {
+    return cachedEnv;
+  }
+
+  cachedEnv = {
+    FIGMA_TOKEN: process.env.FIGMA_TOKEN,
+    FIGMA_FILE_KEY: process.env.FIGMA_FILE_KEY,
+    B2_BUCKET_NAME: getRequiredEnv("B2_BUCKET_NAME"),
+    B2_S3_REGION: getRequiredEnv("B2_S3_REGION"),
+    B2_S3_ENDPOINT: getRequiredEnv("B2_S3_ENDPOINT"),
+    B2_ACCESS_KEY_ID: getRequiredEnv("B2_ACCESS_KEY_ID"),
+    B2_SECRET_ACCESS_KEY: getRequiredEnv("B2_SECRET_ACCESS_KEY"),
+    MAX_UPLOAD_MB: getNumberEnv("MAX_UPLOAD_MB", 10),
+    SIGNED_URL_EXPIRES_SEC: getNumberEnv("SIGNED_URL_EXPIRES_SEC", 900)
+  };
+
+  return cachedEnv;
+}
 
 export function getFigmaEnv() {
+  const env = getEnv();
   return {
-    FIGMA_TOKEN: getRequiredEnv("FIGMA_TOKEN"),
-    FIGMA_FILE_KEY: getRequiredEnv("FIGMA_FILE_KEY")
+    FIGMA_TOKEN: env.FIGMA_TOKEN ?? getRequiredEnv("FIGMA_TOKEN"),
+    FIGMA_FILE_KEY: env.FIGMA_FILE_KEY ?? getRequiredEnv("FIGMA_FILE_KEY")
   };
 }

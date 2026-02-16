@@ -66,6 +66,36 @@ export function getFontMetricsPx(font: Font, fontSizePx: number) {
   };
 }
 
+export function buildSvgPathsForLines(
+  font: Font,
+  lines: string[],
+  startX: number,
+  firstBaselineY: number,
+  fontSizePx: number,
+  lineHeightPx: number
+): string {
+  const fontWithPaths = font as Font & {
+    getPath: (text: string, x: number, y: number, size: number) => {
+      toPathData: (decimalPlaces?: number) => string;
+    };
+  };
+
+  const safeLines = lines.length > 0 ? lines : [""];
+  const paths: string[] = [];
+
+  for (let i = 0; i < safeLines.length; i += 1) {
+    const line = safeLines[i];
+    if (!line) continue;
+    const baselineY = firstBaselineY + i * lineHeightPx;
+    const glyphPath = fontWithPaths.getPath(line, startX, baselineY, fontSizePx);
+    const d = glyphPath.toPathData(3);
+    if (!d) continue;
+    paths.push(`<path d="${d}" />`);
+  }
+
+  return paths.join("");
+}
+
 function splitLongWord(
   word: string,
   maxWidthPx: number,

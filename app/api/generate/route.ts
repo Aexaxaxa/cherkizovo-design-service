@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import sharp from "sharp";
@@ -10,7 +9,13 @@ import { applyRoundedRectMask } from "@/lib/masks";
 import { getObject, getSignedGetUrl, putObject } from "@/lib/s3";
 import { streamToBuffer } from "@/lib/streamToBuffer";
 import { getTemplateById, TPL_VK_POST_1_FIGMA, TPL_VK_POST_1_ID } from "@/lib/templates";
-import { getFontMetricsPx, loadFontCached, measureTextPx, wrapTextByWords } from "@/lib/textLayout";
+import {
+  buildSvgPathsForLines,
+  getFontMetricsPx,
+  loadFontCached,
+  measureTextPx,
+  wrapTextByWords
+} from "@/lib/textLayout";
 
 export const runtime = "nodejs";
 
@@ -39,6 +44,7 @@ type FigmaRenderDebug = {
   sourceFontSize?: number;
   linesCount: number;
   maxLineWidthPx: number;
+  textRender: "paths";
   logoBgMeta: Awaited<ReturnType<sharp.Sharp["metadata"]>>;
 };
 
@@ -309,32 +315,20 @@ async function buildFigmaRenderPng(inputPhoto: Buffer, title: string, fileKey: s
     tpl.layout.textBlock.radii
   );
 
-  const fontBase64 = (await readFile(fontPath)).toString("base64");
-  const fillRgba = tpl.textStyle.color;
   const textXOnBig = textX + offsetX;
   const baselineYOnBig = baselineY + offsetY;
-  const tspanMarkup = normalizedLines
-    .map((line, index) => {
-      const dy = index === 0 ? 0 : lineHeightPx;
-      return `<tspan x="${textXOnBig}" dy="${dy}">${escapeXml(line)}</tspan>`;
-    })
-    .join("");
+  const textPaths = buildSvgPathsForLines(
+    font,
+    normalizedLines,
+    textXOnBig,
+    baselineYOnBig,
+    fontSize,
+    lineHeightPx
+  );
 
   const textSvg = Buffer.from(
     `<svg width="${bigW}" height="${bigH}" viewBox="0 0 ${bigW} ${bigH}" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <style>
-          @font-face {
-            font-family: 'Gotham Pro';
-            src: url(data:font/ttf;base64,${fontBase64}) format('truetype');
-            font-weight: 700;
-            font-style: normal;
-          }
-        </style>
-      </defs>
-      <text x="${textXOnBig}" y="${baselineYOnBig}" dominant-baseline="alphabetic" font-size="${fontSize}" font-family="Gotham Pro" font-weight="${tpl.textStyle.fontWeight}" text-anchor="start" fill="rgba(${fillRgba.r * 255},${fillRgba.g * 255},${fillRgba.b * 255},${fillRgba.a})">
-        ${tspanMarkup}
-      </text>
+      <g fill="rgba(0,0,0,1)">${textPaths}</g>
     </svg>`
   );
 
@@ -387,6 +381,7 @@ async function buildFigmaRenderPng(inputPhoto: Buffer, title: string, fileKey: s
       sourceFontSize: tpl.textStyle.fontSize,
       linesCount,
       maxLineWidthPx,
+      textRender: "paths",
       logoBgMeta
     }
   };

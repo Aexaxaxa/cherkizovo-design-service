@@ -44,6 +44,9 @@ export const TPL_VK_POST_1_FIGMA = {
     fontWeight: 700,
     color: { r: 0, g: 0, b: 0, a: 1 },
     align: "LEFT" as const,
+    lineHeightUnit: "PIXELS",
+    lineHeightPercentFontSize: 100,
+    lineHeightPercentFontSizeNormalized: 100,
     lineHeightPx: 110,
     letterSpacing: 0
   }

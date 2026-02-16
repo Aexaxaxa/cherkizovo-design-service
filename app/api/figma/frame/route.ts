@@ -27,6 +27,8 @@ type FigmaTextStyle = {
   fontSize?: number;
   fontWeight?: number;
   textAlignHorizontal?: string;
+  lineHeightUnit?: string;
+  lineHeightPercentFontSize?: number;
   lineHeightPx?: number;
   letterSpacing?: number;
 };
@@ -105,6 +107,9 @@ type SimplifiedNode = {
     fontSize?: number;
     fontWeight?: number;
     textAlignHorizontal?: string;
+    lineHeightUnit?: string;
+    lineHeightPercentFontSize?: number;
+    lineHeightPercentFontSizeNormalized?: number;
     lineHeightPx?: number;
     letterSpacing?: number;
   };
@@ -166,6 +171,18 @@ function extractSolidPaints(paints: FigmaPaint[] | undefined) {
   return result.length > 0 ? result : undefined;
 }
 
+function normalizeLineHeightPercent(style?: FigmaTextStyle): number {
+  const lhPercent =
+    typeof style?.lineHeightPercentFontSize === "number"
+      ? style.lineHeightPercentFontSize
+      : typeof style?.lineHeightPx === "number" &&
+          typeof style?.fontSize === "number" &&
+          style.fontSize > 0
+        ? (style.lineHeightPx / style.fontSize) * 100
+        : 100;
+  return Number(lhPercent.toFixed(3));
+}
+
 function simplifyNode(node: FigmaNode): SimplifiedNode {
   const simplified: SimplifiedNode = {
     id: node.id,
@@ -215,6 +232,9 @@ function simplifyNode(node: FigmaNode): SimplifiedNode {
       fontSize: node.style?.fontSize,
       fontWeight: node.style?.fontWeight,
       textAlignHorizontal: node.style?.textAlignHorizontal,
+      lineHeightUnit: node.style?.lineHeightUnit,
+      lineHeightPercentFontSize: node.style?.lineHeightPercentFontSize,
+      lineHeightPercentFontSizeNormalized: normalizeLineHeightPercent(node.style),
       lineHeightPx: node.style?.lineHeightPx,
       letterSpacing: node.style?.letterSpacing
     };

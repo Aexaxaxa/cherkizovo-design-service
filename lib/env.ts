@@ -2,6 +2,7 @@ type RuntimeEnv = {
   FIGMA_TOKEN?: string;
   FIGMA_FILE_KEY?: string;
   USE_FIGMA_RENDER?: string;
+  DEBUG_RENDER?: string;
   B2_BUCKET_NAME: string;
   B2_S3_REGION: string;
   B2_S3_ENDPOINT: string;
@@ -42,6 +43,7 @@ export function getEnv(): RuntimeEnv {
     FIGMA_TOKEN: process.env.FIGMA_TOKEN,
     FIGMA_FILE_KEY: process.env.FIGMA_FILE_KEY,
     USE_FIGMA_RENDER: process.env.USE_FIGMA_RENDER,
+    DEBUG_RENDER: process.env.DEBUG_RENDER,
     B2_BUCKET_NAME: getRequiredEnv("B2_BUCKET_NAME"),
     B2_S3_REGION: getRequiredEnv("B2_S3_REGION"),
     B2_S3_ENDPOINT: getRequiredEnv("B2_S3_ENDPOINT"),

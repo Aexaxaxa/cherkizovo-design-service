@@ -39,6 +39,33 @@ export function measureTextPx(
   return baseWidth + spacing;
 }
 
+export function getFontMetricsPx(font: Font, fontSizePx: number) {
+  const fontWithMetrics = font as Font & {
+    unitsPerEm?: number;
+    ascender?: number;
+    descender?: number;
+    tables?: {
+      hhea?: {
+        ascender?: number;
+        descender?: number;
+      };
+    };
+  };
+
+  const unitsPerEm = fontWithMetrics.unitsPerEm || 1000;
+  const ascender = fontWithMetrics.ascender ?? fontWithMetrics.tables?.hhea?.ascender ?? 0;
+  const descender = fontWithMetrics.descender ?? fontWithMetrics.tables?.hhea?.descender ?? 0;
+  const ascPx = (ascender / unitsPerEm) * fontSizePx;
+  const descPx = (Math.abs(descender) / unitsPerEm) * fontSizePx;
+
+  return {
+    unitsPerEm,
+    ascPx,
+    descPx,
+    lineBoxHeightPx: ascPx + descPx
+  };
+}
+
 function splitLongWord(
   word: string,
   maxWidthPx: number,

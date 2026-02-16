@@ -17,6 +17,7 @@ export default function TemplateEditorPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
+  const DEBUG_MAX_CHARS = 20_000;
   const { id: templateId } = use(params);
   const [title, setTitle] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -24,6 +25,8 @@ export default function TemplateEditorPage({
   const [uploadUrl, setUploadUrl] = useState<string>("");
   const [resultUrl, setResultUrl] = useState<string>("");
   const [resultKey, setResultKey] = useState<string>("");
+  const [figmaDebug, setFigmaDebug] = useState<string>("");
+  const [figmaDebugLoading, setFigmaDebugLoading] = useState(false);
   const [status, setStatus] = useState<string>("");
   const [uploading, setUploading] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -90,6 +93,38 @@ export default function TemplateEditorPage({
     }
   }
 
+  async function handleLoadFigmaDebug(refresh = false) {
+    setFigmaDebugLoading(true);
+    try {
+      const refreshParam = refresh ? "&refresh=1" : "";
+      const response = await fetch(
+        `/api/figma/frame?templateId=${encodeURIComponent(templateId)}${refreshParam}`
+      );
+      const payload = (await response.json().catch(() => null)) as unknown;
+      if (!response.ok) {
+        const message =
+          payload &&
+          typeof payload === "object" &&
+          "error" in payload &&
+          typeof payload.error === "string"
+            ? payload.error
+            : `Figma debug failed: ${response.status}`;
+        throw new Error(message);
+      }
+      const serialized = JSON.stringify(payload, null, 2) ?? "";
+      setFigmaDebug(
+        serialized.length > DEBUG_MAX_CHARS
+          ? `${serialized.slice(0, DEBUG_MAX_CHARS)}\n...truncated...`
+          : serialized
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Figma debug error";
+      setFigmaDebug(message);
+    } finally {
+      setFigmaDebugLoading(false);
+    }
+  }
+
   return (
     <main>
       <div className="card">
@@ -123,6 +158,12 @@ export default function TemplateEditorPage({
             <button type="button" onClick={handleGenerate} disabled={!canGenerate}>
               Generate
             </button>
+            <button type="button" onClick={() => handleLoadFigmaDebug(false)} disabled={figmaDebugLoading}>
+              Load Figma debug
+            </button>
+            <button type="button" onClick={() => handleLoadFigmaDebug(true)} disabled={figmaDebugLoading}>
+              Refresh Figma debug
+            </button>
           </div>
         </form>
 
@@ -148,6 +189,13 @@ export default function TemplateEditorPage({
               </a>
             </p>
             <img src={resultUrl} alt="Render result" style={{ maxWidth: "100%", borderRadius: 12 }} />
+          </div>
+        ) : null}
+
+        {figmaDebug ? (
+          <div>
+            <p>Figma debug</p>
+            <pre style={{ overflowX: "auto", whiteSpace: "pre-wrap", fontSize: 12 }}>{figmaDebug}</pre>
           </div>
         ) : null}
       </div>

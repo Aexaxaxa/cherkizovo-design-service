@@ -1,6 +1,7 @@
 import {
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
   type PutObjectCommandInput
@@ -62,7 +63,7 @@ export async function headObject(key: string) {
   );
 }
 
-export async function getSignedGetUrl(key: string) {
+export async function getSignedGetUrl(key: string, expiresInSec?: number) {
   const env = getEnv();
   const s3 = getS3Client();
   const command = new GetObjectCommand({
@@ -70,6 +71,33 @@ export async function getSignedGetUrl(key: string) {
     Key: key
   });
   return getSignedUrl(s3, command, {
-    expiresIn: env.SIGNED_URL_EXPIRES_SEC
+    expiresIn: expiresInSec ?? env.SIGNED_URL_EXPIRES_SEC
   });
+}
+
+export async function listObjectKeysByPrefix(prefix: string): Promise<string[]> {
+  const env = getEnv();
+  const s3 = getS3Client();
+  const out: string[] = [];
+  let continuationToken: string | undefined;
+
+  do {
+    const response = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: env.B2_BUCKET_NAME,
+        Prefix: prefix,
+        ContinuationToken: continuationToken
+      })
+    );
+
+    for (const item of response.Contents ?? []) {
+      if (item.Key) {
+        out.push(item.Key);
+      }
+    }
+
+    continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+  } while (continuationToken);
+
+  return out;
 }

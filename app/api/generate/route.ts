@@ -3,12 +3,13 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import sharp from "sharp";
-import { getEnv } from "@/lib/env";
+import { getEnv, isUniversalEngineEnabled } from "@/lib/env";
 import { getFigmaNodePng } from "@/lib/figmaImages";
 import { applyRoundedRectMask } from "@/lib/masks";
 import { getObject, getSignedGetUrl, putObject } from "@/lib/s3";
 import { streamToBuffer } from "@/lib/streamToBuffer";
 import { getTemplateById, TPL_VK_POST_1_FIGMA, TPL_VK_POST_1_ID } from "@/lib/templates";
+import { renderUniversalTemplate } from "@/lib/universalEngine";
 import {
   buildSvgPathsForLines,
   getFontMetricsPx,
@@ -23,6 +24,7 @@ type GeneratePayload = {
   templateId?: string;
   title?: string;
   objectKey?: string;
+  fields?: Record<string, string>;
 };
 
 type FigmaRenderDebug = {
@@ -389,16 +391,60 @@ async function buildFigmaRenderPng(inputPhoto: Buffer, title: string, fileKey: s
 
 export async function POST(request: Request) {
   const env = getEnv();
+  const universalEnabled = isUniversalEngineEnabled();
   const figmaEnabled = env.USE_FIGMA_RENDER === "1";
   const debugRender = env.DEBUG_RENDER === "1";
-  let renderMode: "figma" | "test" = "test";
   let debugPayload: FigmaRenderDebug | undefined;
 
   try {
     const payload = (await request.json()) as GeneratePayload;
     const templateId = payload.templateId?.trim();
-    const title = payload.title?.trim();
-    const objectKey = payload.objectKey?.trim();
+    const requestFields: Record<string, string> = {};
+    if (payload.fields && typeof payload.fields === "object" && !Array.isArray(payload.fields)) {
+      for (const [key, value] of Object.entries(payload.fields)) {
+        if (typeof value === "string") {
+          requestFields[key] = value;
+        }
+      }
+    }
+
+    if (universalEnabled) {
+      if (!templateId) {
+        return NextResponse.json({ error: "templateId is required" }, { status: 400 });
+      }
+
+      const rendered = await renderUniversalTemplate({
+        templateId,
+        fields: requestFields,
+        includeDebug: debugRender
+      });
+
+      const resultKey = `renders/${randomUUID()}.png`;
+      await putObject({
+        Key: resultKey,
+        Body: rendered.png,
+        ContentType: "image/png"
+      });
+
+      const signedGetUrl = await getSignedGetUrl(resultKey);
+      return NextResponse.json({
+        resultKey,
+        signedGetUrl,
+        renderMode: "universal",
+        ...(debugRender
+          ? {
+              debug: {
+                templateId,
+                fieldsKeys: Object.keys(requestFields),
+                schemaFieldsUsedCount: rendered.debug?.fieldsUsed.length ?? 0
+              }
+            }
+          : {})
+      });
+    }
+
+    const title = payload.title?.trim() ?? "";
+    const objectKey = payload.objectKey?.trim() ?? "";
 
     if (!templateId || !title || !objectKey) {
       return NextResponse.json(
@@ -420,12 +466,10 @@ export async function POST(request: Request) {
 
     let resultPng: Buffer;
     if (figmaEnabled && template.id === TPL_VK_POST_1_ID) {
-      renderMode = "figma";
       const figmaResult = await buildFigmaRenderPng(photoBuffer, title, template.figmaFileKey);
       resultPng = figmaResult.png;
       debugPayload = figmaResult.debug;
     } else {
-      renderMode = "test";
       resultPng = await buildLegacyRenderPng(photoBuffer, title, template.id);
     }
 
@@ -441,12 +485,12 @@ export async function POST(request: Request) {
     return NextResponse.json({
       resultKey,
       signedGetUrl,
-      renderMode,
+      renderMode: "legacy",
       ...(debugRender && debugPayload ? { debug: debugPayload } : {})
     });
   } catch (error) {
     console.error(error);
     const message = error instanceof Error ? error.message : "Generate failed";
-    return NextResponse.json({ error: message, renderMode: "figma" }, { status: 500 });
+    return NextResponse.json({ error: message, renderMode: universalEnabled ? "universal" : "legacy" }, { status: 500 });
   }
 }

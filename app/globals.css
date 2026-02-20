@@ -35,11 +35,17 @@ main {
 }
 
 input[type="text"],
-input[type="file"] {
+input[type="file"],
+textarea {
   width: 100%;
   padding: 10px;
   border: 1px solid #d0d0d0;
   border-radius: 8px;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 96px;
 }
 
 button {
@@ -60,4 +66,62 @@ button:disabled {
 .muted {
   color: #666666;
   font-size: 14px;
+}
+
+.templates-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.template-card {
+  display: flex;
+  flex-direction: column;
+  color: inherit;
+  border: 1px solid #ececec;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.template-preview-link {
+  display: block;
+}
+
+.template-preview {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  background: #f1f1f1;
+}
+
+.template-preview--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #777;
+}
+
+.template-meta {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.template-actions {
+  padding: 0 12px 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.template-actions button {
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.field-block {
+  margin: 12px 0;
 }

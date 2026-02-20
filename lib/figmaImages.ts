@@ -1,4 +1,4 @@
-import { getFigmaEnv } from "@/lib/env";
+import { figmaFetchBytes, figmaFetchJson } from "@/lib/figmaClient";
 import { getObject, headObject, putObject } from "@/lib/s3";
 import { streamToBuffer } from "@/lib/streamToBuffer";
 
@@ -18,15 +18,11 @@ function isNotFoundError(error: unknown): boolean {
   return false;
 }
 
-function toSafeNodeId(nodeId: string): string {
+export function toSafeNodeId(nodeId: string): string {
   return nodeId.replaceAll(":", "_").replaceAll(";", "_");
 }
 
-export async function getFigmaNodePng(fileKey: string, nodeId: string, scale = 1): Promise<Buffer> {
-  const { FIGMA_TOKEN } = getFigmaEnv();
-  const safeNodeId = toSafeNodeId(nodeId);
-  const cacheKey = `figma-cache/${fileKey}/${safeNodeId}.png`;
-
+async function getCachedPng(cacheKey: string): Promise<Buffer | null> {
   try {
     await headObject(cacheKey);
     const cached = await getObject(cacheKey);
@@ -38,35 +34,32 @@ export async function getFigmaNodePng(fileKey: string, nodeId: string, scale = 1
     if (!isNotFoundError(error)) {
       throw error;
     }
+    return null;
   }
+}
 
+async function getImageUrl(fileKey: string, nodeId: string, scale: number): Promise<string> {
   const ids = encodeURIComponent(nodeId);
-  const response = await fetch(
-    `https://api.figma.com/v1/images/${encodeURIComponent(fileKey)}?ids=${ids}&format=png&scale=${scale}`,
-    {
-      method: "GET",
-      headers: {
-        "X-Figma-Token": FIGMA_TOKEN
-      },
-      cache: "no-store"
-    }
+  const payload = await figmaFetchJson<FigmaImagesResponse>(
+    `/v1/images/${encodeURIComponent(fileKey)}?ids=${ids}&format=png&scale=${scale}`
   );
 
-  if (!response.ok) {
-    throw new Error(`Figma images request failed: ${response.status}`);
-  }
-
-  const data = (await response.json()) as FigmaImagesResponse;
-  const imageUrl = data.images?.[nodeId];
+  const imageUrl = payload.images?.[nodeId];
   if (!imageUrl) {
     throw new Error(`Figma image URL not found for node ${nodeId}`);
   }
+  return imageUrl;
+}
 
-  const imageResponse = await fetch(imageUrl, { method: "GET", cache: "no-store" });
-  if (!imageResponse.ok) {
-    throw new Error(`Figma image download failed: ${imageResponse.status}`);
-  }
-  const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
+export async function getFigmaNodePng(fileKey: string, nodeId: string, scale = 1): Promise<Buffer> {
+  const safeNodeId = toSafeNodeId(nodeId);
+  const cacheKey = `figma-cache/${fileKey}/${safeNodeId}.png`;
+
+  const cached = await getCachedPng(cacheKey);
+  if (cached) return cached;
+
+  const imageUrl = await getImageUrl(fileKey, nodeId, scale);
+  const imageBuffer = await figmaFetchBytes(imageUrl);
 
   await putObject({
     Key: cacheKey,
@@ -75,4 +68,23 @@ export async function getFigmaNodePng(fileKey: string, nodeId: string, scale = 1
   });
 
   return imageBuffer;
+}
+
+export async function cacheFigmaPreviewPng(fileKey: string, nodeId: string, scale: number): Promise<string> {
+  const safeNodeId = toSafeNodeId(nodeId);
+  const cacheKey = `figma-previews/${fileKey}/${safeNodeId}.png`;
+
+  const cached = await getCachedPng(cacheKey);
+  if (cached) return cacheKey;
+
+  const imageUrl = await getImageUrl(fileKey, nodeId, scale);
+  const imageBuffer = await figmaFetchBytes(imageUrl);
+
+  await putObject({
+    Key: cacheKey,
+    Body: imageBuffer,
+    ContentType: "image/png"
+  });
+
+  return cacheKey;
 }

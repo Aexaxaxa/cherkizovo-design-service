@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { getEnv, getFigmaEnv } from "@/lib/env";
 import { FigmaApiError, figmaFetchJsonWithMeta } from "@/lib/figmaClient";
-import { getPreviewObjectKey, listExistingPreviewFrameIds } from "@/lib/figmaPreviews";
 import { get, getEntry, set } from "@/lib/memoryCache";
+import { getSignedGetUrl, listObjectKeysByPrefix } from "@/lib/s3";
 
 export const runtime = "nodejs";
 
@@ -15,9 +15,7 @@ type FigmaNode = {
 };
 
 type FigmaFileResponse = {
-  name?: string;
   document?: {
-    name?: string;
     children?: FigmaNode[];
   };
 };
@@ -26,8 +24,7 @@ type TemplateItem = {
   id: string;
   name: string;
   page: string;
-  hasPreview: boolean;
-  previewKey: string | null;
+  previewSignedUrl: string | null;
 };
 
 type TemplatesCacheValue = {
@@ -48,19 +45,13 @@ function parseTemplateFrames(file: FigmaFileResponse): Array<{ id: string; name:
 
   for (const page of pages) {
     const pageName = normalizeName(page.name) || "Untitled";
-
     for (const node of page.children ?? []) {
-      if (node?.type !== "FRAME") continue;
+      if (node.type !== "FRAME") continue;
       if (node.visible === false) continue;
+      if (!node.id || typeof node.id !== "string") continue;
       const name = normalizeName(node.name);
       if (!name.toUpperCase().startsWith("TPL")) continue;
-      if (!node.id || typeof node.id !== "string") continue;
-
-      templates.push({
-        id: node.id,
-        name: name || node.id,
-        page: pageName
-      });
+      templates.push({ id: node.id, name: name || node.id, page: pageName });
     }
   }
 
@@ -74,6 +65,26 @@ function parseTemplateFrames(file: FigmaFileResponse): Array<{ id: string; name:
   return templates;
 }
 
+async function listExistingPreviewNames(): Promise<Set<string>> {
+  const cacheKey = "b2:previews:names:v1";
+  const cached = get<Set<string>>(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const keys = await listObjectKeysByPrefix("previews/");
+  const names = new Set<string>();
+  for (const key of keys) {
+    if (!key.startsWith("previews/")) continue;
+    if (!key.toLowerCase().endsWith(".jpg")) continue;
+    const name = key.slice("previews/".length, -4);
+    if (name) names.add(name);
+  }
+
+  set(cacheKey, names, 300);
+  return names;
+}
+
 async function buildTemplates(fileKey: string): Promise<TemplatesCacheValue> {
   const { data: file } = await figmaFetchJsonWithMeta<FigmaFileResponse>(
     `/v1/files/${encodeURIComponent(fileKey)}`,
@@ -85,39 +96,38 @@ async function buildTemplates(fileKey: string): Promise<TemplatesCacheValue> {
   );
 
   const frames = parseTemplateFrames(file);
-  const previewFrameIds = await listExistingPreviewFrameIds(fileKey);
+  const previewNames = await listExistingPreviewNames();
+  const signedTtlSec = getEnv().SIGNED_URL_EXPIRES_SEC || 900;
 
-  let previewsAvailableCount = 0;
-  const sampleFirst10: Array<{ id: string; name: string; hasPreview: boolean }> = [];
+  const templates: TemplateItem[] = await Promise.all(
+    frames.map(async (frame) => {
+      const hasPreview = previewNames.has(frame.name);
+      if (!hasPreview) {
+        return { id: frame.id, name: frame.name, page: frame.page, previewSignedUrl: null };
+      }
 
-  const templates = frames.map((frame) => {
-    const hasPreview = previewFrameIds.has(frame.id);
-    if (hasPreview) {
-      previewsAvailableCount += 1;
-    }
-    if (sampleFirst10.length < 10) {
-      sampleFirst10.push({
-        id: frame.id,
-        name: frame.name,
-        hasPreview
-      });
-    }
+      const previewKey = `previews/${frame.name}.jpg`;
+      try {
+        const previewSignedUrl = await getSignedGetUrl(previewKey, signedTtlSec);
+        return { id: frame.id, name: frame.name, page: frame.page, previewSignedUrl };
+      } catch {
+        return { id: frame.id, name: frame.name, page: frame.page, previewSignedUrl: null };
+      }
+    })
+  );
 
-    return {
-      id: frame.id,
-      name: frame.name,
-      page: frame.page,
-      hasPreview,
-      previewKey: hasPreview ? getPreviewObjectKey(fileKey, frame.id) : null
-    };
-  });
+  const previewsAvailableCount = templates.filter((item) => item.previewSignedUrl !== null).length;
 
   return {
     templates,
     framesReturned: templates.length,
     previewsAvailableCount,
     previewsMissingCount: Math.max(0, templates.length - previewsAvailableCount),
-    sampleFirst10
+    sampleFirst10: templates.slice(0, 10).map((item) => ({
+      id: item.id,
+      name: item.name,
+      hasPreview: item.previewSignedUrl !== null
+    }))
   };
 }
 
@@ -137,13 +147,12 @@ export async function GET(request: Request) {
         if (debug) {
           return NextResponse.json({
             source: "cache",
+            stale: false,
+            rateLimited: false,
             framesReturned: freshCache.framesReturned,
             previewsAvailableCount: freshCache.previewsAvailableCount,
             previewsMissingCount: freshCache.previewsMissingCount,
-            sampleFirst10: freshCache.sampleFirst10,
-            stale: false,
-            rateLimited: false,
-            retryAfterSec: null
+            sampleFirst10: freshCache.sampleFirst10
           });
         }
         return NextResponse.json(freshCache.templates);
@@ -157,71 +166,48 @@ export async function GET(request: Request) {
       if (debug) {
         return NextResponse.json({
           source: "figma",
+          stale: false,
+          rateLimited: false,
           framesReturned: built.framesReturned,
           previewsAvailableCount: built.previewsAvailableCount,
           previewsMissingCount: built.previewsMissingCount,
-          sampleFirst10: built.sampleFirst10,
-          stale: false,
-          rateLimited: false,
-          retryAfterSec: null
+          sampleFirst10: built.sampleFirst10
         });
       }
-
       return NextResponse.json(built.templates);
     } catch (error) {
-      const staleEntry = getEntry<TemplatesCacheValue>(cacheKey);
-      if (staleEntry) {
-        const staleValue = staleEntry.value;
-        const isRateLimited = error instanceof FigmaApiError && error.status === 429;
+      const staleCache = getEntry<TemplatesCacheValue>(cacheKey);
+      if (staleCache) {
+        const stale = staleCache.value;
         const retryAfterSec = error instanceof FigmaApiError ? error.retryAfterSec ?? null : null;
-        const figmaUnavailable = !isRateLimited;
+        const rateLimited = error instanceof FigmaApiError && error.status === 429;
 
         if (debug) {
           return NextResponse.json({
             source: "stale-cache",
-            framesReturned: staleValue.framesReturned,
-            previewsAvailableCount: staleValue.previewsAvailableCount,
-            previewsMissingCount: staleValue.previewsMissingCount,
-            sampleFirst10: staleValue.sampleFirst10,
             stale: true,
-            rateLimited: isRateLimited,
+            rateLimited,
             retryAfterSec,
-            figmaUnavailable
+            framesReturned: stale.framesReturned,
+            previewsAvailableCount: stale.previewsAvailableCount,
+            previewsMissingCount: stale.previewsMissingCount,
+            sampleFirst10: stale.sampleFirst10
           });
         }
-
-        return NextResponse.json({
-          templates: staleValue.templates,
-          meta: {
-            stale: true,
-            rateLimited: isRateLimited,
-            retryAfterSec,
-            figmaUnavailable
-          }
-        });
+        return NextResponse.json(stale.templates);
       }
 
-      if (error instanceof FigmaApiError) {
-        if (error.status === 429) {
-          return NextResponse.json(
-            {
-              error: "Figma rate limit",
-              retryAfterSec: error.retryAfterSec ?? null
-            },
-            { status: 429 }
-          );
-        }
-
+      if (error instanceof FigmaApiError && error.status === 429) {
         return NextResponse.json(
           {
-            error: "Figma API unavailable",
+            error: "Figma rate limit",
             retryAfterSec: error.retryAfterSec ?? null
           },
-          { status: 503 }
+          { status: 429 }
         );
       }
 
-      throw error;
+      return NextResponse.json({ error: "Figma API unavailable" }, { status: 503 });
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed to load templates";

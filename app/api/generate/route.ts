@@ -391,7 +391,10 @@ async function buildFigmaRenderPng(inputPhoto: Buffer, title: string, fileKey: s
 
 export async function POST(request: Request) {
   const env = getEnv();
-  const universalEnabled = process.env.USE_UNIVERSAL_ENGINE === "1" || isUniversalEngineEnabled();
+  const universalEnabled =
+    process.env.USE_UNIVERSAL_ENGINE === "1" ||
+    process.env.USE_UNIVERSAL_ENGINE === undefined ||
+    isUniversalEngineEnabled();
   const figmaEnabled = env.USE_FIGMA_RENDER === "1";
   const debugRender = env.DEBUG_RENDER === "1";
   let debugPayload: FigmaRenderDebug | undefined;

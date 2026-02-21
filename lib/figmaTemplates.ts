@@ -1,7 +1,6 @@
 ﻿import { getEnv, getFigmaEnv } from "@/lib/env";
 import { getPreviewObjectKey, listExistingPreviewFrameIds } from "@/lib/figmaPreviews";
-import { figmaFetchJsonWithMeta } from "@/lib/figmaClient";
-import { getSignedGetUrl } from "@/lib/s3";
+import { FigmaApiError, figmaFetchJsonWithMeta } from "@/lib/figmaClient";
 import type { FigmaNodeLite } from "@/lib/figmaLayout";
 
 type FigmaFileResponse = {
@@ -23,7 +22,8 @@ export type TemplateListItem = {
   id: string;
   name: string;
   page: string;
-  previewSignedUrl: string | null;
+  hasPreview: boolean;
+  previewKey: string | null;
 };
 
 export type TemplateListDebug = {
@@ -69,8 +69,6 @@ const fieldNameCollator = new Intl.Collator("ru", {
   sensitivity: "base",
   numeric: true
 });
-
-const PREVIEW_SIGNED_URL_SEC = 900;
 
 function getTtlMs(): number {
   return getEnv().FIGMA_CACHE_TTL_SEC * 1000;
@@ -150,9 +148,16 @@ function countVisibleFrames(file: FigmaFileResponse): number {
   return framesFoundTotal;
 }
 
-async function loadTemplatesFromFigma(fileKey: string): Promise<TemplatesCacheValue> {
+async function loadTemplatesFromFigma(fileKey: string, options?: { fastFail?: boolean }): Promise<TemplatesCacheValue> {
+  const fastFail = options?.fastFail === true;
   const { data: file, meta } = await figmaFetchJsonWithMeta<FigmaFileResponse>(
-    `/v1/files/${encodeURIComponent(fileKey)}`
+    `/v1/files/${encodeURIComponent(fileKey)}`,
+    fastFail
+      ? {
+          maxRetries: 0,
+          sleepOn429: false
+        }
+      : {}
   );
 
   const items = sortTemplates(toTemplateCacheItems(file));
@@ -166,27 +171,41 @@ async function loadTemplatesFromFigma(fileKey: string): Promise<TemplatesCacheVa
   };
 }
 
-async function getTemplatesCacheValue(refresh = false): Promise<TemplatesCacheValue> {
+async function getTemplatesCacheValue(options?: {
+  refresh?: boolean;
+  allowStaleOnRateLimit?: boolean;
+  fastFail?: boolean;
+}): Promise<TemplatesCacheValue> {
+  const refresh = options?.refresh === true;
+  const allowStaleOnRateLimit = options?.allowStaleOnRateLimit ?? true;
+  const fastFail = options?.fastFail === true;
   const fileKey = getFileKey();
   const cacheKey = `templates:${fileKey}`;
+  const staleCached = templatesCache.get(cacheKey);
 
   if (!refresh) {
-    const cached = templatesCache.get(cacheKey);
+    const cached = staleCached;
     if (cached && cached.expiresAt > Date.now()) {
       return cached.value;
     }
   }
 
-  const value = await loadTemplatesFromFigma(fileKey);
-  templatesCache.set(cacheKey, {
-    expiresAt: Date.now() + getTtlMs(),
-    value
-  });
-
-  return value;
+  try {
+    const value = await loadTemplatesFromFigma(fileKey, { fastFail });
+    templatesCache.set(cacheKey, {
+      expiresAt: Date.now() + getTtlMs(),
+      value
+    });
+    return value;
+  } catch (error) {
+    if (allowStaleOnRateLimit && error instanceof FigmaApiError && error.status === 429 && staleCached) {
+      return staleCached.value;
+    }
+    throw error;
+  }
 }
 
-async function buildTemplatesWithPreviewUrls(items: TemplateListCacheItem[]): Promise<{
+async function buildTemplatesWithPreviewState(items: TemplateListCacheItem[]): Promise<{
   templates: TemplateListItem[];
   previewsAvailableCount: number;
   previewsMissingCount: number;
@@ -213,21 +232,12 @@ async function buildTemplatesWithPreviewUrls(items: TemplateListCacheItem[]): Pr
       });
     }
 
-    let previewSignedUrl: string | null = null;
-    if (hasPreview) {
-      const objectKey = getPreviewObjectKey(fileKey, item.id);
-      try {
-        previewSignedUrl = await getSignedGetUrl(objectKey, PREVIEW_SIGNED_URL_SEC);
-      } catch {
-        previewSignedUrl = null;
-      }
-    }
-
     templates.push({
       id: item.id,
       name: item.name,
       page: item.page,
-      previewSignedUrl
+      hasPreview,
+      previewKey: hasPreview ? getPreviewObjectKey(fileKey, item.id) : null
     });
   }
 
@@ -241,8 +251,12 @@ async function buildTemplatesWithPreviewUrls(items: TemplateListCacheItem[]): Pr
 
 export async function listTemplates(options?: { refresh?: boolean }): Promise<TemplateListItem[]> {
   const refresh = options?.refresh === true;
-  const cacheValue = await getTemplatesCacheValue(refresh);
-  const withPreview = await buildTemplatesWithPreviewUrls(cacheValue.items);
+  const cacheValue = await getTemplatesCacheValue({
+    refresh,
+    allowStaleOnRateLimit: true,
+    fastFail: true
+  });
+  const withPreview = await buildTemplatesWithPreviewState(cacheValue.items);
   return withPreview.templates;
 }
 
@@ -250,8 +264,12 @@ export async function listTemplatesWithDebug(options?: {
   refresh?: boolean;
 }): Promise<{ templates: TemplateListItem[]; debug: TemplateListDebug }> {
   const refresh = options?.refresh === true;
-  const cacheValue = await getTemplatesCacheValue(refresh);
-  const withPreview = await buildTemplatesWithPreviewUrls(cacheValue.items);
+  const cacheValue = await getTemplatesCacheValue({
+    refresh,
+    allowStaleOnRateLimit: true,
+    fastFail: true
+  });
+  const withPreview = await buildTemplatesWithPreviewState(cacheValue.items);
 
   return {
     templates: withPreview.templates,
@@ -273,7 +291,11 @@ export async function listTemplateFrames(options?: { refresh?: boolean }): Promi
 }> {
   const refresh = options?.refresh === true;
   const fileKey = getFileKey();
-  const cacheValue = await getTemplatesCacheValue(refresh);
+  const cacheValue = await getTemplatesCacheValue({
+    refresh,
+    allowStaleOnRateLimit: false,
+    fastFail: false
+  });
 
   return {
     fileKey,

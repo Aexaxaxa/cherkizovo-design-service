@@ -5,6 +5,12 @@ const FIGMA_TIMEOUT_MS = 15_000;
 const FIGMA_MAX_RETRIES = 3;
 const MAX_JITTER_MS = 200;
 
+export type FigmaFetchOptions = {
+  maxRetries?: number;
+  sleepOn429?: boolean;
+  timeoutMs?: number;
+};
+
 export type FigmaResponseMeta = {
   status: number;
   url: string;
@@ -82,12 +88,23 @@ function resolveFigmaUrl(pathOrUrl: string): string {
 }
 
 async function figmaFetchRaw(pathOrUrl: string, asBytes: boolean): Promise<{ data: unknown; meta: FigmaResponseMeta }> {
+  return figmaFetchRawWithOptions(pathOrUrl, asBytes, {});
+}
+
+async function figmaFetchRawWithOptions(
+  pathOrUrl: string,
+  asBytes: boolean,
+  options: FigmaFetchOptions
+): Promise<{ data: unknown; meta: FigmaResponseMeta }> {
   const { FIGMA_TOKEN } = getFigmaEnv();
   const url = resolveFigmaUrl(pathOrUrl);
+  const maxRetries = Number.isInteger(options.maxRetries) ? Math.max(0, options.maxRetries ?? 0) : FIGMA_MAX_RETRIES;
+  const sleepOn429 = options.sleepOn429 ?? true;
+  const timeoutMs = Number.isFinite(options.timeoutMs) && (options.timeoutMs ?? 0) > 0 ? (options.timeoutMs as number) : FIGMA_TIMEOUT_MS;
 
-  for (let attempt = 0; attempt <= FIGMA_MAX_RETRIES; attempt += 1) {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FIGMA_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const response = await fetch(url, {
@@ -114,9 +131,11 @@ async function figmaFetchRaw(pathOrUrl: string, asBytes: boolean): Promise<{ dat
         }
 
         if (response.status === 429) {
-          if (attempt < FIGMA_MAX_RETRIES) {
-            const baseDelay = retryAfterSec !== null ? retryAfterSec * 1000 : getRetryDelayMs(retryAfter, attempt);
-            await sleep(baseDelay + Math.floor(Math.random() * (MAX_JITTER_MS + 1)));
+          if (attempt < maxRetries) {
+            if (sleepOn429) {
+              const baseDelay = retryAfterSec !== null ? retryAfterSec * 1000 : getRetryDelayMs(retryAfter, attempt);
+              await sleep(baseDelay + Math.floor(Math.random() * (MAX_JITTER_MS + 1)));
+            }
             continue;
           }
           throw new FigmaApiError(messageFromPayload ?? "Figma API rate limit exceeded", {
@@ -168,7 +187,7 @@ async function figmaFetchRaw(pathOrUrl: string, asBytes: boolean): Promise<{ dat
         throw error;
       }
       if (error instanceof DOMException && error.name === "AbortError") {
-        throw new FigmaApiError(`Figma API request timed out after ${FIGMA_TIMEOUT_MS / 1000}s`, {
+        throw new FigmaApiError(`Figma API request timed out after ${Math.round(timeoutMs / 1000)}s`, {
           status: 504
         });
       }
@@ -183,12 +202,15 @@ async function figmaFetchRaw(pathOrUrl: string, asBytes: boolean): Promise<{ dat
 }
 
 export async function figmaFetchJson<T>(pathOrUrl: string): Promise<T> {
-  const result = await figmaFetchRaw(pathOrUrl, false);
+  const result = await figmaFetchRawWithOptions(pathOrUrl, false, {});
   return result.data as T;
 }
 
-export async function figmaFetchJsonWithMeta<T>(pathOrUrl: string): Promise<{ data: T; meta: FigmaResponseMeta }> {
-  const result = await figmaFetchRaw(pathOrUrl, false);
+export async function figmaFetchJsonWithMeta<T>(
+  pathOrUrl: string,
+  options: FigmaFetchOptions = {}
+): Promise<{ data: T; meta: FigmaResponseMeta }> {
+  const result = await figmaFetchRawWithOptions(pathOrUrl, false, options);
   return {
     data: result.data as T,
     meta: result.meta
@@ -196,7 +218,7 @@ export async function figmaFetchJsonWithMeta<T>(pathOrUrl: string): Promise<{ da
 }
 
 export async function figmaFetchBytes(pathOrUrl: string): Promise<Buffer> {
-  const bytes = (await figmaFetchRaw(pathOrUrl, true)).data;
+  const bytes = (await figmaFetchRawWithOptions(pathOrUrl, true, {})).data;
   if (!Buffer.isBuffer(bytes)) {
     throw new FigmaApiError("Failed to download binary payload from Figma", { status: 500 });
   }

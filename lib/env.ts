@@ -3,6 +3,9 @@ type RuntimeEnv = {
   FIGMA_FILE_KEY?: string;
   USE_FIGMA_RENDER?: string;
   USE_UNIVERSAL_ENGINE?: string;
+  FIGMA_TEMPLATES_TTL_SEC: number;
+  FIGMA_SCHEMA_TTL_SEC: number;
+  FIGMA_FILE_TTL_SEC: number;
   FIGMA_CACHE_TTL_SEC: number;
   FIGMA_PREVIEW_SCALE: number;
   DEBUG_RENDER?: string;
@@ -59,6 +62,9 @@ export function getEnv(): RuntimeEnv {
     FIGMA_FILE_KEY: process.env.FIGMA_FILE_KEY,
     USE_FIGMA_RENDER: process.env.USE_FIGMA_RENDER,
     USE_UNIVERSAL_ENGINE: process.env.USE_UNIVERSAL_ENGINE,
+    FIGMA_TEMPLATES_TTL_SEC: getNumberEnv("FIGMA_TEMPLATES_TTL_SEC", 1800),
+    FIGMA_SCHEMA_TTL_SEC: getNumberEnv("FIGMA_SCHEMA_TTL_SEC", 7200),
+    FIGMA_FILE_TTL_SEC: getNumberEnv("FIGMA_FILE_TTL_SEC", 1800),
     FIGMA_CACHE_TTL_SEC: getNumberEnv("FIGMA_CACHE_TTL_SEC", 900),
     FIGMA_PREVIEW_SCALE: getFloatEnv("FIGMA_PREVIEW_SCALE", 0.25),
     DEBUG_RENDER: process.env.DEBUG_RENDER,

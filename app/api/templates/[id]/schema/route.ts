@@ -1,4 +1,7 @@
 import { NextResponse } from "next/server";
+import { getEnv, getFigmaEnv } from "@/lib/env";
+import { FigmaApiError, figmaFetchJsonWithMeta } from "@/lib/figmaClient";
+import { get, getEntry, set } from "@/lib/memoryCache";
 
 export const runtime = "nodejs";
 
@@ -18,6 +21,14 @@ type SchemaField = {
   key: string;
   type: "text" | "image";
   label: string;
+};
+
+type SchemaPayload = {
+  templateId: string;
+  templateName: string;
+  fields: SchemaField[];
+  fieldsCount: number;
+  totalNodesVisited: number;
 };
 
 function normalizeName(value: unknown): string {
@@ -85,97 +96,143 @@ function collectFields(root: FigmaNode): { fields: SchemaField[]; totalNodesVisi
   };
 }
 
-async function fetchFrameNode(fileKey: string, token: string, frameId: string): Promise<FigmaNode> {
-  const response = await fetch(
-    `https://api.figma.com/v1/files/${encodeURIComponent(fileKey)}/nodes?ids=${encodeURIComponent(frameId)}`,
+async function buildSchema(fileKey: string, frameId: string): Promise<SchemaPayload> {
+  const { data } = await figmaFetchJsonWithMeta<FigmaNodesResponse>(
+    `/v1/files/${encodeURIComponent(fileKey)}/nodes?ids=${encodeURIComponent(frameId)}`,
     {
-      method: "GET",
-      headers: {
-        "X-Figma-Token": token
-      },
-      cache: "no-store"
+      maxRetries: 0,
+      sleepOn429: false,
+      timeoutMs: 5000
     }
   );
 
-  if (!response.ok) {
-    const body = (await response.text().catch(() => "")).slice(0, 500);
-    return Promise.reject({
-      kind: "figma_http",
-      status: response.status,
-      statusText: response.statusText,
-      body
-    });
-  }
-
-  const payload = (await response.json()) as FigmaNodesResponse;
-  const frame = payload.nodes?.[frameId]?.document;
-  if (!frame) {
+  const frameNode = data.nodes?.[frameId]?.document;
+  if (!frameNode) {
     throw new Error(`Frame node not found: ${frameId}`);
   }
 
-  return frame;
+  const templateName = normalizeName(frameNode.name) || frameId;
+  const { fields, totalNodesVisited } = collectFields(frameNode);
+
+  return {
+    templateId: frameId,
+    templateName,
+    fields,
+    fieldsCount: fields.length,
+    totalNodesVisited
+  };
 }
 
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  try {
-    const { id } = await params;
-    const frameId = decodeURIComponent(id);
-    const debug = new URL(request.url).searchParams.get("debug") === "1";
+export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const frameId = decodeURIComponent(id);
+  const { searchParams } = new URL(request.url);
+  const debug = searchParams.get("debug") === "1";
+  const refresh = searchParams.get("refresh") === "1";
 
+  try {
     if (!frameId) {
       return NextResponse.json({ error: "Template id is required" }, { status: 400 });
     }
 
-    const fileKey = process.env.FIGMA_FILE_KEY?.trim();
-    const token = process.env.FIGMA_TOKEN?.trim();
+    const env = getEnv();
+    const { FIGMA_FILE_KEY: fileKey } = getFigmaEnv();
+    const cacheKey = `${fileKey}:schema:v1:${frameId}`;
 
-    if (!fileKey || !token) {
-      return NextResponse.json({ error: "Missing FIGMA_FILE_KEY or FIGMA_TOKEN in environment" }, { status: 500 });
+    if (!refresh) {
+      const fresh = get<SchemaPayload>(cacheKey);
+      if (fresh) {
+        if (debug) {
+          return NextResponse.json({
+            source: "cache",
+            stale: false,
+            rateLimited: false,
+            retryAfterSec: null,
+            templateId: fresh.templateId,
+            templateName: fresh.templateName,
+            fieldsCount: fresh.fieldsCount,
+            first20Fields: fresh.fields.slice(0, 20),
+            totalNodesVisited: fresh.totalNodesVisited
+          });
+        }
+
+        return NextResponse.json({
+          templateId: fresh.templateId,
+          templateName: fresh.templateName,
+          fields: fresh.fields
+        });
+      }
     }
 
-    const frameNode = await fetchFrameNode(fileKey, token, frameId);
-    const templateName = normalizeName(frameNode.name) || frameId;
-    const { fields, totalNodesVisited } = collectFields(frameNode);
+    try {
+      const payload = await buildSchema(fileKey, frameId);
+      set(cacheKey, payload, env.FIGMA_SCHEMA_TTL_SEC);
 
-    if (debug) {
+      if (debug) {
+        return NextResponse.json({
+          source: "figma",
+          stale: false,
+          rateLimited: false,
+          retryAfterSec: null,
+          templateId: payload.templateId,
+          templateName: payload.templateName,
+          fieldsCount: payload.fieldsCount,
+          first20Fields: payload.fields.slice(0, 20),
+          totalNodesVisited: payload.totalNodesVisited
+        });
+      }
+
       return NextResponse.json({
-        templateId: frameId,
-        templateName,
-        fieldsCount: fields.length,
-        first20Fields: fields.slice(0, 20),
-        totalNodesVisited
+        templateId: payload.templateId,
+        templateName: payload.templateName,
+        fields: payload.fields
       });
-    }
+    } catch (error) {
+      const stale = getEntry<SchemaPayload>(cacheKey);
+      if (stale) {
+        const staleValue = stale.value;
+        const isRateLimited = error instanceof FigmaApiError && error.status === 429;
+        const retryAfterSec = error instanceof FigmaApiError ? error.retryAfterSec ?? null : null;
 
-    return NextResponse.json({
-      templateId: frameId,
-      templateName,
-      fields
-    });
+        if (debug) {
+          return NextResponse.json({
+            source: "stale-cache",
+            stale: true,
+            rateLimited: isRateLimited,
+            retryAfterSec,
+            templateId: staleValue.templateId,
+            templateName: staleValue.templateName,
+            fieldsCount: staleValue.fieldsCount,
+            first20Fields: staleValue.fields.slice(0, 20),
+            totalNodesVisited: staleValue.totalNodesVisited
+          });
+        }
+
+        return NextResponse.json({
+          templateId: staleValue.templateId,
+          templateName: staleValue.templateName,
+          fields: staleValue.fields,
+          meta: {
+            stale: true,
+            rateLimited: isRateLimited,
+            retryAfterSec
+          }
+        });
+      }
+
+      if (error instanceof FigmaApiError) {
+        return NextResponse.json(
+          {
+            error: "Figma API unavailable",
+            retryAfterSec: error.retryAfterSec ?? null
+          },
+          { status: 429 }
+        );
+      }
+
+      throw error;
+    }
   } catch (error) {
-    if (
-      error &&
-      typeof error === "object" &&
-      "kind" in error &&
-      error.kind === "figma_http" &&
-      "status" in error &&
-      "statusText" in error &&
-      "body" in error
-    ) {
-      return NextResponse.json(
-        {
-          error: "Figma API request failed",
-          status: error.status,
-          statusText: error.statusText,
-          body: error.body
-        },
-        { status: 502 }
-      );
-    }
-
     const message = error instanceof Error ? error.message : "Failed to load template schema";
     return NextResponse.json({ error: message }, { status: 500 });
   }

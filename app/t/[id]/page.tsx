@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, use, useEffect, useMemo, useState } from "react";
+import { FormEvent, use, useCallback, useEffect, useMemo, useState } from "react";
 
 type SchemaField = {
   key: string;
@@ -41,62 +41,54 @@ export default function TemplateEditorPage({
   const [uploadedImageUrls, setUploadedImageUrls] = useState<Record<string, string>>({});
   const [status, setStatus] = useState("Loading schema...");
   const [loadingSchema, setLoadingSchema] = useState(true);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
   const [uploadingField, setUploadingField] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [resultKey, setResultKey] = useState("");
   const [resultUrl, setResultUrl] = useState("");
   const [debugText, setDebugText] = useState("");
 
-  useEffect(() => {
-    let cancelled = false;
+  const loadSchema = useCallback(async () => {
+    setLoadingSchema(true);
+    setSchemaError(null);
+    setStatus("Loading schema...");
 
-    async function loadSchema() {
-      setLoadingSchema(true);
-      setStatus("Loading schema...");
-      try {
-        const response = await fetch(`/api/templates/${encodeURIComponent(decodedId)}/schema`, {
-          cache: "no-store"
-        });
-        const payload = (await response.json().catch(() => null)) as
-          | { error?: string }
-          | SchemaResponse
-          | null;
+    try {
+      const response = await fetch(`/api/templates/${encodeURIComponent(decodedId)}/schema`, {
+        cache: "no-store"
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | { error?: string }
+        | SchemaResponse
+        | null;
 
-        if (!response.ok) {
-          throw new Error(
-            payload && typeof payload === "object" && "error" in payload && payload.error
-              ? payload.error
-              : `Schema request failed: ${response.status}`
-          );
-        }
-
-        if (!payload || typeof payload !== "object" || !("fields" in payload) || !Array.isArray(payload.fields)) {
-          throw new Error("Schema response has invalid format");
-        }
-
-        if (cancelled) return;
-
-        setTemplateName(payload.templateName || decodedId);
-        setSchemaFields(payload.fields);
-        setStatus(payload.fields.length > 0 ? "" : "Template has no editable fields");
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to load schema";
-        if (!cancelled) {
-          setStatus(message);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoadingSchema(false);
-        }
+      if (!response.ok) {
+        throw new Error(
+          payload && typeof payload === "object" && "error" in payload && payload.error
+            ? payload.error
+            : `Schema request failed: ${response.status}`
+        );
       }
+
+      if (!payload || typeof payload !== "object" || !("fields" in payload) || !Array.isArray(payload.fields)) {
+        throw new Error("Schema response has invalid format");
+      }
+
+      setTemplateName(payload.templateName || decodedId);
+      setSchemaFields(payload.fields);
+      setStatus(payload.fields.length > 0 ? "" : "Template has no editable fields");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to load schema";
+      setSchemaError(message);
+      setStatus(message);
+    } finally {
+      setLoadingSchema(false);
     }
-
-    void loadSchema();
-
-    return () => {
-      cancelled = true;
-    };
   }, [decodedId]);
+
+  useEffect(() => {
+    void loadSchema();
+  }, [loadSchema]);
 
   const canGenerate = useMemo(() => {
     if (generating || loadingSchema) return false;
@@ -157,13 +149,18 @@ export default function TemplateEditorPage({
     setStatus("Generating...");
 
     try {
+      const generatePayload = {
+        templateId: decodedId,
+        fields
+      };
+      if (process.env.NODE_ENV !== "production") {
+        console.log("[generate] payload", generatePayload);
+      }
+
       const response = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          templateId: decodedId,
-          fields
-        })
+        body: JSON.stringify(generatePayload)
       });
 
       const payload = (await response.json().catch(() => null)) as
@@ -206,6 +203,13 @@ export default function TemplateEditorPage({
         </p>
 
         {status ? <p className="muted">{status}</p> : null}
+        {schemaError ? (
+          <div className="row">
+            <button type="button" onClick={() => void loadSchema()} disabled={loadingSchema}>
+              {loadingSchema ? "Retrying..." : "Retry"}
+            </button>
+          </div>
+        ) : null}
         {!loadingSchema && schemaFields.length === 0 ? (
           <p className="muted">0 editable fields for this template</p>
         ) : null}

@@ -1,6 +1,5 @@
 import path from "node:path";
 import sharp from "sharp";
-import { getEnv } from "@/lib/env";
 import {
   buildLayoutTree,
   containerMaxContentWidth,
@@ -11,8 +10,6 @@ import {
   type FigmaNodeLite,
   type LayoutNode
 } from "@/lib/figmaLayout";
-import { getTemplateFrameNode } from "@/lib/figmaTemplates";
-import { getFigmaNodePng } from "@/lib/figmaImages";
 import { buildRoundedRectPath } from "@/lib/roundedRectPath";
 import { getObject } from "@/lib/s3";
 import { streamToBuffer } from "@/lib/streamToBuffer";
@@ -25,7 +22,7 @@ import {
 } from "@/lib/textLayout";
 
 export type UniversalRenderDebug = {
-  layoutSource: "figma_api";
+  layoutSource: "snapshot_b2";
   frameW: number;
   frameH: number;
   fieldsUsed: string[];
@@ -42,13 +39,32 @@ export type UniversalRenderDebug = {
   };
   editables: Array<{
     name: string;
+    origW: number;
     origBBox: { x: number; y: number; width: number; height: number };
     newBBox: { x: number; y: number; width: number; height: number };
     constraintH: string;
     constraintV: string;
-    hasExplicitMaxWidth: boolean;
+    isExplicitWidth: boolean;
+    isFixedWidth: boolean;
+    containerW: number;
+    paddingL: number;
+    paddingR: number;
+    explicitMaxContentWidth?: number;
     maxTextWidth: number;
     linesCount: number;
+    finalBlockW: number;
+    textH: number;
+  }>;
+  textContainers: Array<{
+    containerName: string;
+    isFixedWidth: boolean;
+    containerW: number;
+    paddingL: number;
+    paddingR: number;
+    maxTextWidth: number;
+    finalPillW: number;
+    lines: number;
+    textH: number;
   }>;
 };
 
@@ -178,37 +194,42 @@ async function createSolidRectLayer(
   };
 }
 
-async function createImageLayerForNode(
-  node: LayoutNode,
-  fileKey: string,
-  frameX: number,
-  frameY: number
-): Promise<Layer | null> {
-  if (!node.id || !node.bbox) return null;
-  const rel = toRelativeBbox(node, frameX, frameY);
-  if (!rel) return null;
-
-  const width = ensureLayerGeometry(rel.width, 1);
-  const height = ensureLayerGeometry(rel.height, 1);
-  const png = await getFigmaNodePng(fileKey, node.id, 1);
-  const input = await sharp(png).resize(width, height, { fit: "fill" }).ensureAlpha().png().toBuffer();
-
-  return {
-    nodeId: node.id,
-    left: toInt(rel.x),
-    top: toInt(rel.y),
-    width,
-    height,
-    input
-  };
-}
-
 async function getUploadBuffer(objectKey: string): Promise<Buffer> {
   const source = await getObject(objectKey);
   if (!source.Body) {
     throw new Error(`Source object body is empty for key ${objectKey}`);
   }
   return streamToBuffer(source.Body);
+}
+
+async function getSnapshotAssetBuffer(assetKey: string, cache: Map<string, Buffer>): Promise<Buffer> {
+  const cached = cache.get(assetKey);
+  if (cached) return cached;
+  const source = await getObject(assetKey);
+  if (!source.Body) {
+    throw new Error(`Snapshot asset body is empty for key ${assetKey}`);
+  }
+  const buffer = await streamToBuffer(source.Body);
+  cache.set(assetKey, buffer);
+  return buffer;
+}
+
+async function applyOpacityToPng(input: Buffer, opacity: number): Promise<Buffer> {
+  const normalized = clamp(opacity, 0, 1);
+  if (normalized >= 0.999) return input;
+  const { data, info } = await sharp(input).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  for (let i = 3; i < data.length; i += info.channels) {
+    data[i] = Math.round(data[i] * normalized);
+  }
+  return sharp(data, {
+    raw: {
+      width: info.width,
+      height: info.height,
+      channels: info.channels
+    }
+  })
+    .png()
+    .toBuffer();
 }
 
 async function renderEditablePhoto(
@@ -332,12 +353,11 @@ async function renderEditableText(
 
   const explicitMaxContentWidth = container ? containerMaxContentWidth(container) : undefined;
   const frameLimit = Math.max(1, frameW - origX - paddingLeft - paddingRight);
-
-  let maxTextWidth = container
-    ? explicitMaxContentWidth !== undefined
-      ? Math.max(1, Math.min(explicitMaxContentWidth, frameLimit))
-      : frameLimit
-    : Math.max(1, origW);
+  const containerWidth = container?.bbox?.width ?? origW;
+  const isFixedWidth = Boolean(container && explicitMaxContentWidth !== undefined);
+  let maxTextWidth = isFixedWidth
+    ? Math.max(1, containerWidth - paddingLeft - paddingRight)
+    : Math.max(1, Math.min(frameLimit, 1600));
 
   const fontPath = resolveFontPath(style.fontPostScriptName);
   const font = await loadFontCached(fontPath);
@@ -351,7 +371,11 @@ async function renderEditableText(
   }, 0);
 
   let textBoxWidth = Math.max(1, Math.min(maxTextWidth, maxLineWidthPx));
-  let blockW = container ? textBoxWidth + paddingLeft + paddingRight : origW;
+  let blockW = container
+    ? isFixedWidth
+      ? Math.max(1, containerWidth)
+      : textBoxWidth + paddingLeft + paddingRight
+    : origW;
 
   let textBlockHeightPx = (lines.length - 1) * lineHeightPx + (metrics.ascPx + metrics.descPx);
   let blockH = container ? paddingTop + textBlockHeightPx + paddingBottom : origH;
@@ -449,9 +473,18 @@ async function renderEditableText(
       },
       constraintH,
       constraintV,
-      hasExplicitMaxWidth: container ? isExplicitWidth(container) : false,
+      origW: Math.max(1, Math.round(origW)),
+      isExplicitWidth: container ? isExplicitWidth(container) : false,
+      isFixedWidth,
+      containerW: Math.max(1, Math.round(containerWidth)),
+      paddingL: Math.max(0, Math.round(paddingLeft)),
+      paddingR: Math.max(0, Math.round(paddingRight)),
+      explicitMaxContentWidth:
+        typeof explicitMaxContentWidth === "number" ? Math.max(1, Math.round(explicitMaxContentWidth)) : undefined,
       maxTextWidth: Math.max(1, Math.round(maxTextWidth)),
-      linesCount: lines.length
+      linesCount: lines.length,
+      finalBlockW: width,
+      textH: Math.max(1, Math.round(textBlockHeightPx))
     }
   };
 }
@@ -471,7 +504,6 @@ function collectNodes(root: LayoutNode): LayoutNode[] {
 }
 
 type RenderTreeContext = {
-  fileKey: string;
   frameX: number;
   frameY: number;
   frameW: number;
@@ -482,6 +514,9 @@ type RenderTreeContext = {
   containerTextMap: Map<string, LayoutNode>;
   handledTextNodeIds: Set<string>;
   editableDebug: EditableTextDebug[];
+  textContainerDebug: UniversalRenderDebug["textContainers"];
+  assetsCache: Map<string, Buffer>;
+  assetsMap: Record<string, string>;
 };
 
 async function renderNodeTree(node: LayoutNode, context: RenderTreeContext): Promise<Layer[]> {
@@ -541,13 +576,33 @@ async function renderNodeTree(node: LayoutNode, context: RenderTreeContext): Pro
   } else if ((node.type === "FRAME" || node.type === "RECTANGLE") && hasSolidFill(node)) {
     const rectLayer = await createSolidRectLayer(node, context.frameX, context.frameY);
     if (rectLayer) layers.push(rectLayer);
-  } else if (ATOMIC_IMAGE_TYPES.has(node.type)) {
-    const imageLayer = await createImageLayerForNode(node, context.fileKey, context.frameX, context.frameY);
-    if (imageLayer) layers.push(imageLayer);
+  } else if ((context.assetsMap[node.id] || node.assetKey) && node.bbox) {
+    const rel = toRelativeBbox(node, context.frameX, context.frameY);
+    if (rel) {
+      const width = ensureLayerGeometry(rel.width, 1);
+      const height = ensureLayerGeometry(rel.height, 1);
+      const assetKey = context.assetsMap[node.id] || node.assetKey;
+      if (!assetKey) return layers;
+      let buffer = await getSnapshotAssetBuffer(assetKey, context.assetsCache);
+      buffer = await sharp(buffer).resize(width, height, { fit: "fill" }).png().toBuffer();
+      buffer = await applyOpacityToPng(buffer, node.opacity);
+      layers.push({
+        nodeId: node.id,
+        left: toInt(rel.x),
+        top: toInt(rel.y),
+        width,
+        height,
+        input: buffer
+      });
+    }
     return layers;
-  } else if (node.children.length === 0 && node.bbox) {
-    const imageLayer = await createImageLayerForNode(node, context.fileKey, context.frameX, context.frameY);
-    if (imageLayer) layers.push(imageLayer);
+  } else if (ATOMIC_IMAGE_TYPES.has(node.type) && hasSolidFill(node)) {
+    const fallbackLayer = await createSolidRectLayer(node, context.frameX, context.frameY);
+    if (fallbackLayer) layers.push(fallbackLayer);
+    return layers;
+  } else if (node.children.length === 0 && node.bbox && hasSolidFill(node)) {
+    const fallbackLayer = await createSolidRectLayer(node, context.frameX, context.frameY);
+    if (fallbackLayer) layers.push(fallbackLayer);
   }
 
   for (const child of node.children) {
@@ -564,11 +619,11 @@ async function renderNodeTree(node: LayoutNode, context: RenderTreeContext): Pro
 export async function renderUniversalTemplate(input: {
   templateId: string;
   fields: Record<string, string>;
+  frameNode: FigmaNodeLite;
   refresh?: boolean;
   includeDebug?: boolean;
 }): Promise<UniversalRenderResult> {
-  const frameNode = await getTemplateFrameNode(input.templateId, input.refresh === true);
-  const tree = buildLayoutTree(frameNode as FigmaNodeLite);
+  const tree = buildLayoutTree(input.frameNode as FigmaNodeLite);
   const frame = tree.root;
 
   if (!frame.bbox) {
@@ -579,13 +634,6 @@ export async function renderUniversalTemplate(input: {
   const frameY = ensureFinite("frameY", frame.bbox.y);
   const frameW = ensureLayerGeometry(frame.bbox.width, 1);
   const frameH = ensureLayerGeometry(frame.bbox.height, 1);
-  const { FIGMA_FILE_KEY } = getEnv();
-  const fileKey = FIGMA_FILE_KEY;
-
-  if (!fileKey) {
-    throw new Error("FIGMA_FILE_KEY is required for universal renderer");
-  }
-
   const allNodes = collectNodes(frame);
   const editableTextNodes = allNodes.filter((node) => node.visible && getEditableKind(node.name) === "text");
   const containerTextMap = new Map<string, LayoutNode>();
@@ -599,9 +647,13 @@ export async function renderUniversalTemplate(input: {
   }
 
   const editableDebug: EditableTextDebug[] = [];
+  const textContainerDebug: UniversalRenderDebug["textContainers"] = [];
   const fieldsUsed = new Set<string>();
+  const frameAssetsMap =
+    input.frameNode && typeof input.frameNode === "object" && input.frameNode.assetsMap
+      ? input.frameNode.assetsMap
+      : {};
   const allLayers = await renderNodeTree(frame, {
-    fileKey,
     frameX,
     frameY,
     frameW,
@@ -611,8 +663,25 @@ export async function renderUniversalTemplate(input: {
     treeById: tree.byId,
     containerTextMap,
     handledTextNodeIds,
-    editableDebug
+    editableDebug,
+    textContainerDebug,
+    assetsCache: new Map<string, Buffer>(),
+    assetsMap: frameAssetsMap
   });
+
+  for (const item of editableDebug) {
+    textContainerDebug.push({
+      containerName: item.name,
+      isFixedWidth: item.isFixedWidth,
+      containerW: item.containerW,
+      paddingL: item.paddingL,
+      paddingR: item.paddingR,
+      maxTextWidth: item.maxTextWidth,
+      finalPillW: item.finalBlockW,
+      lines: item.linesCount,
+      textH: item.textH
+    });
+  }
 
   let minX = 0;
   let minY = 0;
@@ -671,7 +740,7 @@ export async function renderUniversalTemplate(input: {
   return {
     png,
     debug: {
-      layoutSource: "figma_api",
+      layoutSource: "snapshot_b2",
       frameW,
       frameH,
       fieldsUsed: [...fieldsUsed],
@@ -686,7 +755,8 @@ export async function renderUniversalTemplate(input: {
         paddingLeft,
         paddingTop
       },
-      editables: editableDebug
+      editables: editableDebug,
+      textContainers: textContainerDebug
     }
   };
 }

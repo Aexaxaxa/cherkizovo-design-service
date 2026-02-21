@@ -7,6 +7,7 @@ import { getEnv, isUniversalEngineEnabled } from "@/lib/env";
 import { getFigmaNodePng } from "@/lib/figmaImages";
 import { applyRoundedRectMask } from "@/lib/masks";
 import { getObject, getSignedGetUrl, putObject } from "@/lib/s3";
+import { getFrameSnapshotKey, tryReadSnapshotJson } from "@/lib/snapshotStore";
 import { streamToBuffer } from "@/lib/streamToBuffer";
 import { getTemplateById, TPL_VK_POST_1_FIGMA, TPL_VK_POST_1_ID } from "@/lib/templates";
 import { renderUniversalTemplate } from "@/lib/universalEngine";
@@ -416,9 +417,21 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: "templateId is required" }, { status: 400 });
       }
 
+      const fileKey = env.FIGMA_FILE_KEY?.trim();
+      if (!fileKey) {
+        return NextResponse.json({ error: "Missing FIGMA_FILE_KEY" }, { status: 500 });
+      }
+
+      const frameSnapshotKey = getFrameSnapshotKey(fileKey, templateId);
+      const frameNode = await tryReadSnapshotJson<unknown>(frameSnapshotKey);
+      if (!frameNode || typeof frameNode !== "object") {
+        return NextResponse.json({ error: "No snapshot. Run POST /api/admin/sync" }, { status: 503 });
+      }
+
       const rendered = await renderUniversalTemplate({
         templateId,
         fields: requestFields,
+        frameNode: frameNode as Parameters<typeof renderUniversalTemplate>[0]["frameNode"],
         includeDebug: debugRender
       });
 
@@ -439,7 +452,8 @@ export async function POST(request: Request) {
               debug: {
                 mode: "universal",
                 templateId,
-                fieldsKeys: Object.keys(requestFields)
+                fieldsKeys: Object.keys(requestFields),
+                render: rendered.debug
               }
             }
           : {})

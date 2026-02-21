@@ -23,6 +23,7 @@ export type FigmaNodeLite = {
   type?: string;
   visible?: boolean;
   opacity?: number;
+  assetKey?: string;
   absoluteBoundingBox?: {
     x?: number;
     y?: number;
@@ -43,6 +44,7 @@ export type FigmaNodeLite = {
   layoutSizingVertical?: "FIXED" | "HUG" | "FILL" | string;
   primaryAxisSizingMode?: "FIXED" | "AUTO" | string;
   counterAxisSizingMode?: "FIXED" | "AUTO" | string;
+  assetsMap?: Record<string, string>;
   characters?: string;
   style?: {
     fontPostScriptName?: string;
@@ -63,6 +65,7 @@ export type LayoutNode = {
   type: string;
   visible: boolean;
   opacity: number;
+  assetKey?: string;
   bbox?: {
     x: number;
     y: number;
@@ -180,6 +183,7 @@ function toLayoutNode(input: FigmaNodeLite, parentId: string | undefined, byId: 
     type: input.type ?? "UNKNOWN",
     visible: input.visible !== false,
     opacity: isFiniteNumber(input.opacity) ? input.opacity : 1,
+    assetKey: typeof input.assetKey === "string" ? input.assetKey : undefined,
     bbox: normalizeBbox(input),
     fills: normalizeFills(input.fills),
     radii: normalizeRadii(input),
@@ -246,7 +250,11 @@ export function isExplicitWidth(node: LayoutNode): boolean {
     return true;
   }
 
-  if (node.primaryAxisSizingMode === "FIXED" || node.counterAxisSizingMode === "FIXED") {
+  if (node.counterAxisSizingMode === "FIXED") {
+    return true;
+  }
+
+  if (node.constraints?.horizontal === "LEFT_RIGHT") {
     return true;
   }
 
@@ -255,7 +263,6 @@ export function isExplicitWidth(node: LayoutNode): boolean {
     node.layoutMode &&
     node.layoutMode !== "NONE" &&
     node.layoutSizingHorizontal !== "HUG" &&
-    node.primaryAxisSizingMode !== "AUTO" &&
     node.counterAxisSizingMode !== "AUTO"
   ) {
     return true;

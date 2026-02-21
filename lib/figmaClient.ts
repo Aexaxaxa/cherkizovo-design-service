@@ -217,8 +217,8 @@ export async function figmaFetchJsonWithMeta<T>(
   };
 }
 
-export async function figmaFetchBytes(pathOrUrl: string): Promise<Buffer> {
-  const bytes = (await figmaFetchRawWithOptions(pathOrUrl, true, {})).data;
+export async function figmaFetchBytes(pathOrUrl: string, options: FigmaFetchOptions = {}): Promise<Buffer> {
+  const bytes = (await figmaFetchRawWithOptions(pathOrUrl, true, options)).data;
   if (!Buffer.isBuffer(bytes)) {
     throw new FigmaApiError("Failed to download binary payload from Figma", { status: 500 });
   }

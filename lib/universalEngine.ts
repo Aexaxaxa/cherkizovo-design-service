@@ -180,6 +180,10 @@ function toInt(value: number): number {
   return Math.round(value);
 }
 
+function getNodeGap(node: Pick<LayoutNode, "itemSpacing">): number {
+  return node.itemSpacing !== undefined && node.itemSpacing !== null ? node.itemSpacing : 50;
+}
+
 function ensureFinite(name: string, value: number): number {
   if (!Number.isFinite(value)) {
     throw new Error(`${name} is not finite`);
@@ -802,7 +806,7 @@ async function renderEditableText(
     ? Math.max(1, (isFixed ? origW : maxWForAnchor) - paddingLeft - paddingRight)
     : Math.max(1, origW);
   const isAutoLayoutContainer = Boolean(container && container.layoutMode && container.layoutMode !== "NONE");
-  const itemSpacing = container ? (Number.isFinite(container.itemSpacing) ? (container.itemSpacing as number) : 50) : 0;
+  const itemSpacing = container ? getNodeGap(container) : 0;
   const resolveWrapWidthForNode = (nodeIndex: number, innerW: number): number => {
     const childW = nodeWrapWidths[nodeIndex];
     if (
@@ -1135,7 +1139,7 @@ function computeIntrinsicSize(
   const paddingRight = node.paddingRight ?? 0;
   const paddingTop = node.paddingTop ?? 0;
   const paddingBottom = node.paddingBottom ?? 0;
-  const spacing = Number.isFinite(node.itemSpacing) ? (node.itemSpacing as number) : 50;
+  const spacing = getNodeGap(node);
   const childSizes = node.children.map((child) => computeIntrinsicSize(child, cache));
 
   let contentW = 0;
@@ -1164,18 +1168,33 @@ function getRawRelativeBox(node: LayoutNode, frameX: number, frameY: number): La
 }
 
 function getSizingMode(node: LayoutNode, axis: "horizontal" | "vertical"): "FIXED" | "HUG" | "FILL" {
+  const isHorizontalLayout = node.layoutMode === "HORIZONTAL";
+  const isVerticalLayout = node.layoutMode === "VERTICAL";
+  const axisSizingMode =
+    axis === "horizontal"
+      ? isHorizontalLayout
+        ? node.primaryAxisSizingMode
+        : isVerticalLayout
+          ? node.counterAxisSizingMode
+          : node.counterAxisSizingMode
+      : isVerticalLayout
+        ? node.primaryAxisSizingMode
+        : isHorizontalLayout
+          ? node.counterAxisSizingMode
+          : node.primaryAxisSizingMode;
+
   if (axis === "horizontal") {
     if (node.layoutSizingHorizontal === "FILL") return "FILL";
     if (node.layoutSizingHorizontal === "HUG") return "HUG";
     if (node.layoutSizingHorizontal === "FIXED") return "FIXED";
-    if (node.counterAxisSizingMode === "FIXED") return "FIXED";
+    if (axisSizingMode === "FIXED") return "FIXED";
     if (node.constraints?.horizontal === "LEFT_RIGHT") return "FILL";
     return "HUG";
   }
   if (node.layoutSizingVertical === "FILL") return "FILL";
   if (node.layoutSizingVertical === "HUG") return "HUG";
   if (node.layoutSizingVertical === "FIXED") return "FIXED";
-  if (node.primaryAxisSizingMode === "FIXED") return "FIXED";
+  if (axisSizingMode === "FIXED") return "FIXED";
   if (node.constraints?.vertical === "TOP_BOTTOM") return "FILL";
   return "HUG";
 }
@@ -1201,7 +1220,7 @@ function buildComputedLayoutBoxes(root: LayoutNode, frameX: number, frameY: numb
     const padR = node.paddingRight ?? 0;
     const padT = node.paddingTop ?? 0;
     const padB = node.paddingBottom ?? 0;
-    const gap = Number.isFinite(node.itemSpacing) ? (node.itemSpacing as number) : 50;
+    const gap = getNodeGap(node);
     const innerX = nodeBox.x + padL;
     const innerY = nodeBox.y + padT;
     const innerW = Math.max(1, nodeBox.width - padL - padR);
@@ -1240,7 +1259,7 @@ function buildComputedLayoutBoxes(root: LayoutNode, frameX: number, frameY: numb
     const totalSpacing = Math.max(0, childSpecs.length - 1) * gap;
     const innerMain = mainAxis === "horizontal" ? innerW : innerH;
     const leftoverMain = Math.max(0, innerMain - fixedMainTotal - totalSpacing);
-    const fillMainSize = fillCount > 0 ? Math.max(1, Math.floor(leftoverMain / fillCount)) : 0;
+    const fillMainSize = fillCount > 0 ? Math.max(0, leftoverMain / fillCount) : 0;
 
     let cursor = 0;
     for (const spec of childSpecs) {

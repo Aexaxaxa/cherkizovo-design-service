@@ -51,8 +51,18 @@ export type UniversalRenderDebug = {
     explicitMaxContentWidth?: number;
     maxTextWidth: number;
     linesCount: number;
+    linesA: number;
+    linesB: number;
     finalBlockW: number;
     textH: number;
+    initialInnerW: number;
+    finalInnerW: number;
+    innerH: number;
+    contentTop: number;
+    ascent: number;
+    layoutMode?: string;
+    primaryAxisAlignItems?: string;
+    counterAxisAlignItems?: string;
   }>;
   textContainers: Array<{
     containerName: string;
@@ -64,6 +74,16 @@ export type UniversalRenderDebug = {
     finalPillW: number;
     lines: number;
     textH: number;
+    initialInnerW?: number;
+    finalInnerW?: number;
+    linesA?: number;
+    linesB?: number;
+    innerH?: number;
+    contentTop?: number;
+    ascent?: number;
+    layoutMode?: string;
+    primaryAxisAlignItems?: string;
+    counterAxisAlignItems?: string;
   }>;
   badBoxes?: Array<{
     label: string;
@@ -675,6 +695,23 @@ function buildAlignedTextPaths(
   return out;
 }
 
+function normalizeAxisAlign(value: string | undefined): "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN" {
+  if (value === "CENTER") return "CENTER";
+  if (value === "MAX") return "MAX";
+  if (value === "SPACE_BETWEEN") return "SPACE_BETWEEN";
+  return "MIN";
+}
+
+function alignOffset(
+  align: "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN",
+  innerSize: number,
+  contentSize: number
+): number {
+  if (align === "CENTER") return Math.max(0, (innerSize - contentSize) / 2);
+  if (align === "MAX") return Math.max(0, innerSize - contentSize);
+  return 0;
+}
+
 function getManualAssetType(name: string): "sticker" | "marks" | null {
   const normalized = name.trim().toLowerCase();
   if (normalized === "sticker") return "sticker";
@@ -764,34 +801,52 @@ async function renderEditableText(
   let maxTextWidth = container
     ? Math.max(1, (isFixed ? origW : maxWForAnchor) - paddingLeft - paddingRight)
     : Math.max(1, origW);
-  let measured = await Promise.all(
+  const isAutoLayoutContainer = Boolean(container && container.layoutMode && container.layoutMode !== "NONE");
+  const itemSpacing = container ? (Number.isFinite(container.itemSpacing) ? (container.itemSpacing as number) : 50) : 0;
+  const resolveWrapWidthForNode = (nodeIndex: number, innerW: number): number => {
+    const childW = nodeWrapWidths[nodeIndex];
+    if (
+      isAutoLayoutContainer &&
+      container?.layoutMode === "HORIZONTAL" &&
+      typeof childW === "number" &&
+      Number.isFinite(childW)
+    ) {
+      return Math.max(1, Math.min(innerW, childW));
+    }
+    return Math.max(1, innerW);
+  };
+
+  const initialInnerW = maxTextWidth;
+  const measuredA = await Promise.all(
     nodes.map((textNode, index) => {
-      const wrapW = nodeWrapWidths[index] ?? maxTextWidth;
-      return measureTextBlock(textNode, rawTexts[index], Math.max(1, Math.min(maxTextWidth, wrapW)));
+      const wrapW = resolveWrapWidthForNode(index, initialInnerW);
+      return measureTextBlock(textNode, rawTexts[index], wrapW);
     })
   );
+  const measuredTextW_A = measuredA.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
+  const tentativePillW = container
+    ? isFixed
+      ? origW
+      : clamp(measuredTextW_A + paddingLeft + paddingRight, 1, maxWForAnchor)
+    : origW;
+  const finalPillW = Math.max(1, tentativePillW);
+  const finalInnerW = container ? Math.max(1, finalPillW - paddingLeft - paddingRight) : Math.max(1, origW);
 
-  let measuredTextW = measured.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
+  const measuredB = await Promise.all(
+    nodes.map((textNode, index) => {
+      const wrapW = resolveWrapWidthForNode(index, finalInnerW);
+      return measureTextBlock(textNode, rawTexts[index], wrapW);
+    })
+  );
+  const measuredTextW_B = measuredB.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
   let blockW = container
     ? isFixed
       ? origW
-      : clamp(measuredTextW + paddingLeft + paddingRight, 1, maxWForAnchor)
+      : clamp(measuredTextW_B + paddingLeft + paddingRight, 1, maxWForAnchor)
     : origW;
+  maxTextWidth = finalInnerW;
+  const measured = measuredB;
 
-  if (container && !isFixed) {
-    maxTextWidth = Math.max(1, blockW - paddingLeft - paddingRight);
-    measured = await Promise.all(
-      nodes.map((textNode, index) => {
-        const wrapW = nodeWrapWidths[index] ?? maxTextWidth;
-        return measureTextBlock(textNode, rawTexts[index], Math.max(1, Math.min(maxTextWidth, wrapW)));
-      })
-    );
-    measuredTextW = measured.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
-    blockW = clamp(measuredTextW + paddingLeft + paddingRight, 1, maxWForAnchor);
-  }
-
-  const isAutoLayoutContainer = Boolean(container && container.layoutMode && container.layoutMode !== "NONE");
-  const itemSpacing = container ? (Number.isFinite(container.itemSpacing) ? (container.itemSpacing as number) : 50) : 0;
   const textBlockHeightPx = isAutoLayoutContainer
     ? measured.reduce((sum, item) => sum + item.textBlockHeightPx, 0) + Math.max(0, measured.length - 1) * itemSpacing
     : measured.length > 0
@@ -856,44 +911,90 @@ async function renderEditableText(
   const innerTop = paddingTop;
   const innerBottom = blockH - paddingBottom;
   const innerHeight = Math.max(1, innerBottom - innerTop);
+  const innerLeft = paddingLeft;
   const innerWidth = Math.max(1, blockW - paddingLeft - paddingRight);
-  const contentHeight = isAutoLayoutContainer
-    ? measured.reduce((sum, item) => sum + item.textBlockHeightPx, 0) + Math.max(0, measured.length - 1) * itemSpacing
-    : measured.length > 0
-      ? measured[0].textBlockHeightPx
-      : 0;
-  const contentTop = innerTop + Math.max(0, (innerHeight - contentHeight) / 2);
+  const contentHeight = measured.length > 0
+    ? isAutoLayoutContainer && container?.layoutMode === "HORIZONTAL"
+      ? measured.reduce((max, item) => Math.max(max, item.textBlockHeightPx), 0)
+      : measured.reduce((sum, item) => sum + item.textBlockHeightPx, 0) + Math.max(0, measured.length - 1) * (isAutoLayoutContainer ? itemSpacing : 0)
+    : 0;
+  const contentWidth = measured.length > 0
+    ? isAutoLayoutContainer && container?.layoutMode === "HORIZONTAL"
+      ? measured.reduce((sum, item) => sum + item.maxLineWidthPx, 0) + Math.max(0, measured.length - 1) * itemSpacing
+      : measured.reduce((max, item) => Math.max(max, item.maxLineWidthPx), 0)
+    : 0;
+  const primaryAlign = normalizeAxisAlign(container?.primaryAxisAlignItems);
+  const counterAlign = normalizeAxisAlign(container?.counterAxisAlignItems);
+  const isHorizontalLayout = container?.layoutMode === "HORIZONTAL";
+  const contentTop = isHorizontalLayout
+    ? innerTop + alignOffset(counterAlign, innerHeight, contentHeight)
+    : innerTop + alignOffset(primaryAlign, innerHeight, contentHeight);
+  const contentLeft = isHorizontalLayout
+    ? innerLeft + alignOffset(primaryAlign, innerWidth, contentWidth)
+    : innerLeft + alignOffset(counterAlign, innerWidth, contentWidth);
+  const linesA = measuredA.reduce((sum, item) => sum + item.lines.length, 0);
+  const linesB = measured.reduce((sum, item) => sum + item.lines.length, 0);
+  const ascent = measured.length > 0 ? measured[0].metrics.ascPx : 0;
 
   if (process.env.DEBUG_RENDER === "1" && container) {
     console.warn("[universalEngine] pill-content-center", {
       pillName: container.name || node.name,
+      layoutMode: container.layoutMode,
+      primaryAxisAlignItems: container.primaryAxisAlignItems,
+      counterAxisAlignItems: container.counterAxisAlignItems,
+      initialInnerW,
+      finalPillW: blockW,
+      finalInnerW: innerWidth,
+      linesA,
+      linesB,
       pillH: blockH,
       paddingTop,
       paddingBottom,
       innerH: innerHeight,
       contentHeight,
-      contentTop
+      computedContentTop: contentTop,
+      ascent
     });
+    if (linesA !== linesB) {
+      console.warn("[universalEngine] wrap-changed-after-final-width", {
+        pillName: container.name || node.name,
+        linesA,
+        linesB
+      });
+    }
   }
 
   let textPaths = "";
   if (isAutoLayoutContainer && measured.length > 0) {
     let cursorY = contentTop;
+    let cursorX = contentLeft;
     for (const item of measured) {
-      const childBox = computedBoxes?.get(item.node.id);
-      const textTopY = cursorY;
-      const baselineY = textTopY + item.metrics.ascPx;
-      const itemInnerLeft = childBox ? Math.max(paddingLeft, childBox.x - newX) : paddingLeft;
-      const itemInnerWidth = childBox ? Math.max(1, childBox.width) : innerWidth;
-      const paths = buildAlignedTextPaths(item, itemInnerLeft, itemInnerWidth, baselineY);
+      const itemInnerWidth = isHorizontalLayout
+        ? Math.max(1, Math.min(innerWidth, item.maxLineWidthPx))
+        : Math.max(1, Math.min(innerWidth, item.maxLineWidthPx));
+      const itemH = Math.max(1, item.textBlockHeightPx);
+      const itemLeft = isHorizontalLayout
+        ? cursorX
+        : innerLeft + alignOffset(counterAlign, innerWidth, itemInnerWidth);
+      const itemTop = isHorizontalLayout
+        ? innerTop + alignOffset(counterAlign, innerHeight, itemH)
+        : cursorY;
+      const baselineY = itemTop + item.metrics.ascPx;
+      const paths = buildAlignedTextPaths(item, itemLeft, itemInnerWidth, baselineY);
       textPaths += `<g fill="${rgbaToCss(item.color)}">${paths}</g>`;
-      cursorY += item.textBlockHeightPx + itemSpacing;
+      if (isHorizontalLayout) {
+        cursorX += itemInnerWidth + itemSpacing;
+      } else {
+        cursorY += itemH + itemSpacing;
+      }
     }
   } else if (measured.length > 0) {
     const item = measured[0];
     const textTopY = contentTop;
     const baselineY = textTopY + item.metrics.ascPx;
-    const paths = buildAlignedTextPaths(item, paddingLeft, innerWidth, baselineY);
+    const itemInnerWidth = Math.max(1, Math.min(innerWidth, item.maxLineWidthPx));
+    const itemLeft = innerLeft + alignOffset(counterAlign, innerWidth, itemInnerWidth);
+    const paths = buildAlignedTextPaths(item, itemLeft, itemInnerWidth, baselineY);
     textPaths = `<g fill="${rgbaToCss(item.color)}">${paths}</g>`;
   }
 
@@ -960,9 +1061,19 @@ async function renderEditableText(
       paddingL: Math.max(0, Math.round(paddingLeft)),
       paddingR: Math.max(0, Math.round(paddingRight)),
       maxTextWidth: Math.max(1, Math.round(maxTextWidth)),
-      linesCount: measured.reduce((sum, item) => sum + item.lines.length, 0),
+      linesCount: linesB,
+      linesA,
+      linesB,
       finalBlockW: width,
-      textH: Math.max(1, Math.round(textBlockHeightPx))
+      textH: Math.max(1, Math.round(textBlockHeightPx)),
+      initialInnerW: Math.max(1, Math.round(initialInnerW)),
+      finalInnerW: Math.max(1, Math.round(innerWidth)),
+      innerH: Math.max(1, Math.round(innerHeight)),
+      contentTop: Math.max(0, Math.round(contentTop)),
+      ascent: Math.max(0, Math.round(ascent)),
+      layoutMode: container?.layoutMode,
+      primaryAxisAlignItems: container?.primaryAxisAlignItems,
+      counterAxisAlignItems: container?.counterAxisAlignItems
     }
   };
 }
@@ -1480,7 +1591,17 @@ export async function renderUniversalTemplate(input: {
       maxTextWidth: item.maxTextWidth,
       finalPillW: item.finalBlockW,
       lines: item.linesCount,
-      textH: item.textH
+      textH: item.textH,
+      initialInnerW: item.initialInnerW,
+      finalInnerW: item.finalInnerW,
+      linesA: item.linesA,
+      linesB: item.linesB,
+      innerH: item.innerH,
+      contentTop: item.contentTop,
+      ascent: item.ascent,
+      layoutMode: item.layoutMode,
+      primaryAxisAlignItems: item.primaryAxisAlignItems,
+      counterAxisAlignItems: item.counterAxisAlignItems
     });
   }
 

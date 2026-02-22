@@ -39,6 +39,8 @@ export type FigmaNodeLite = {
   paddingTop?: number;
   paddingBottom?: number;
   itemSpacing?: number;
+  primaryAxisAlignItems?: "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN" | string;
+  counterAxisAlignItems?: "MIN" | "CENTER" | "MAX" | "BASELINE" | string;
   constraints?: FigmaConstraint;
   layoutSizingHorizontal?: "FIXED" | "HUG" | "FILL" | string;
   layoutSizingVertical?: "FIXED" | "HUG" | "FILL" | string;
@@ -88,6 +90,8 @@ export type LayoutNode = {
   paddingTop?: number;
   paddingBottom?: number;
   itemSpacing?: number;
+  primaryAxisAlignItems?: string;
+  counterAxisAlignItems?: string;
   constraints?: {
     horizontal?: string;
     vertical?: string;
@@ -199,6 +203,8 @@ function toLayoutNode(input: FigmaNodeLite, parentId: string | undefined, byId: 
     paddingTop: input.paddingTop,
     paddingBottom: input.paddingBottom,
     itemSpacing: input.itemSpacing,
+    primaryAxisAlignItems: input.primaryAxisAlignItems,
+    counterAxisAlignItems: input.counterAxisAlignItems,
     constraints: {
       horizontal: input.constraints?.horizontal,
       vertical: input.constraints?.vertical

@@ -35,6 +35,7 @@ main {
 }
 
 input[type="text"],
+select,
 input[type="file"],
 textarea {
   width: 100%;
@@ -78,20 +79,22 @@ button:disabled {
   display: flex;
   flex-direction: column;
   color: inherit;
+  text-decoration: none;
   border: 1px solid #ececec;
   border-radius: 12px;
   overflow: hidden;
   background: #fff;
 }
 
-.template-preview-link {
-  display: block;
+.template-preview-wrap {
+  width: 100%;
+  max-width: 360px;
 }
 
 .template-preview {
   width: 100%;
-  aspect-ratio: 1 / 1;
-  object-fit: cover;
+  height: auto;
+  display: block;
   background: #f1f1f1;
 }
 
@@ -107,19 +110,6 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 6px;
-}
-
-.template-actions {
-  padding: 0 12px 12px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-}
-
-.template-actions button {
-  padding: 8px 10px;
-  font-size: 13px;
 }
 
 .field-block {

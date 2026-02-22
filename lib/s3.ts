@@ -1,4 +1,5 @@
 import {
+  DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
@@ -46,6 +47,17 @@ export async function getObject(key: string) {
   const s3 = getS3Client();
   return s3.send(
     new GetObjectCommand({
+      Bucket: env.B2_BUCKET_NAME,
+      Key: key
+    })
+  );
+}
+
+export async function deleteObject(key: string) {
+  const env = getEnv();
+  const s3 = getS3Client();
+  return s3.send(
+    new DeleteObjectCommand({
       Bucket: env.B2_BUCKET_NAME,
       Key: key
     })

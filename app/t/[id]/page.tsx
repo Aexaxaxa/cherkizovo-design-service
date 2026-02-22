@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, use, useCallback, useEffect, useMemo, useState } from "react";
+import { use, useCallback, useEffect, useMemo, useState } from "react";
 
 type SchemaField = {
   key: string;
@@ -14,17 +14,63 @@ type SchemaResponse = {
   fields: SchemaField[];
 };
 
-type UploadResponse = {
-  objectKey: string;
-  signedGetUrl: string;
+type UploadBatchResponse = {
+  ok: true;
+  objectKeys: Record<string, string>;
 };
 
 type GenerateResponse = {
   resultKey: string;
   signedGetUrl: string;
-  renderMode?: "universal" | "legacy" | "figma" | "test";
-  debug?: unknown;
 };
+
+type UiError = {
+  code: string;
+  message: string;
+};
+
+function asUiError(code: string, message: string): UiError {
+  return { code, message };
+}
+
+function parseApiError(payload: unknown): UiError {
+  if (!payload || typeof payload !== "object") {
+    return asUiError("E_GENERATE_FAILED", "Не удалось выполнить операцию");
+  }
+  const code = "code" in payload && typeof payload.code === "string" ? payload.code : "E_GENERATE_FAILED";
+  const message = "error" in payload && typeof payload.error === "string" ? payload.error : "Не удалось выполнить операцию";
+  return asUiError(code, message);
+}
+
+function toSchemaLoadError(error: unknown): UiError {
+  console.error("[schema]", error);
+  return asUiError("E_SCHEMA_LOAD_FAILED", "Не удалось загрузить поля шаблона");
+}
+
+function toUploadError(payload: unknown, fallbackStatus: number): UiError {
+  const parsed = parseApiError(payload);
+  if (parsed.code === "E_UPLOAD_TOO_LARGE") {
+    return asUiError("E_UPLOAD_TOO_LARGE", "Файл слишком большой. Максимум 15MB");
+  }
+  if (parsed.code === "E_UPLOAD_TYPE") {
+    return asUiError("E_UPLOAD_TYPE", "Неподдерживаемый формат файла. Разрешены JPEG, PNG, WEBP");
+  }
+  if (fallbackStatus >= 500) {
+    return asUiError("E_UPLOAD_FAILED", "Ошибка загрузки файла. Повторите попытку");
+  }
+  return parsed.code ? parsed : asUiError("E_UPLOAD_FAILED", "Ошибка загрузки файла");
+}
+
+function toGenerateError(payload: unknown): UiError {
+  const parsed = parseApiError(payload);
+  if (parsed.code && parsed.code.startsWith("E_TEXT_REQUIRED_")) {
+    return parsed;
+  }
+  if (parsed.code && parsed.code.startsWith("E_PHOTO_REQUIRED_")) {
+    return parsed;
+  }
+  return asUiError("E_GENERATE_FAILED", "Не удалось создать изображение");
+}
 
 export default function TemplateEditorPage({
   params
@@ -38,49 +84,45 @@ export default function TemplateEditorPage({
   const [schemaFields, setSchemaFields] = useState<SchemaField[]>([]);
   const [fields, setFields] = useState<Record<string, string>>({});
   const [selectedFiles, setSelectedFiles] = useState<Record<string, File | null>>({});
-  const [uploadedImageUrls, setUploadedImageUrls] = useState<Record<string, string>>({});
-  const [status, setStatus] = useState("Loading schema...");
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState<UiError | null>(null);
   const [loadingSchema, setLoadingSchema] = useState(true);
-  const [schemaError, setSchemaError] = useState<string | null>(null);
-  const [uploadingField, setUploadingField] = useState<string | null>(null);
+  const [uploadingAll, setUploadingAll] = useState(false);
   const [generating, setGenerating] = useState(false);
-  const [resultKey, setResultKey] = useState("");
   const [resultUrl, setResultUrl] = useState("");
-  const [debugText, setDebugText] = useState("");
+
+  const textFields = useMemo(() => schemaFields.filter((field) => field.type === "text"), [schemaFields]);
+  const imageFields = useMemo(() => schemaFields.filter((field) => field.type === "image"), [schemaFields]);
 
   const loadSchema = useCallback(async () => {
     setLoadingSchema(true);
-    setSchemaError(null);
-    setStatus("Loading schema...");
+    setError(null);
+    setStatus("Загрузка полей...");
 
     try {
       const response = await fetch(`/api/templates/${encodeURIComponent(decodedId)}/schema`, {
         cache: "no-store"
       });
-      const payload = (await response.json().catch(() => null)) as
-        | { error?: string }
-        | SchemaResponse
-        | null;
+      const payload = (await response.json().catch(() => null)) as SchemaResponse | { error?: string } | null;
 
       if (!response.ok) {
         throw new Error(
-          payload && typeof payload === "object" && "error" in payload && payload.error
+          payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string"
             ? payload.error
             : `Schema request failed: ${response.status}`
         );
       }
-
       if (!payload || typeof payload !== "object" || !("fields" in payload) || !Array.isArray(payload.fields)) {
         throw new Error("Schema response has invalid format");
       }
 
       setTemplateName(payload.templateName || decodedId);
       setSchemaFields(payload.fields);
-      setStatus(payload.fields.length > 0 ? "" : "Template has no editable fields");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to load schema";
-      setSchemaError(message);
-      setStatus(message);
+      setStatus("");
+    } catch (err) {
+      const friendly = toSchemaLoadError(err);
+      setError(friendly);
+      setStatus(`${friendly.message} (${friendly.code})`);
     } finally {
       setLoadingSchema(false);
     }
@@ -90,105 +132,113 @@ export default function TemplateEditorPage({
     void loadSchema();
   }, [loadSchema]);
 
-  const canGenerate = useMemo(() => {
-    if (generating || loadingSchema) return false;
-    return true;
-  }, [generating, loadingSchema]);
+  const canUpload = useMemo(() => {
+    if (loadingSchema || uploadingAll || generating) return false;
+    return imageFields.some((field) => selectedFiles[field.key] instanceof File);
+  }, [generating, imageFields, loadingSchema, selectedFiles, uploadingAll]);
 
-  async function handleUpload(fieldKey: string, event: FormEvent) {
-    event.preventDefault();
-    const file = selectedFiles[fieldKey];
-    if (!file) {
-      setStatus(`Select a file for ${fieldKey}`);
-      return;
-    }
+  const canGenerate = useMemo(() => !loadingSchema && !uploadingAll && !generating, [generating, loadingSchema, uploadingAll]);
 
-    setUploadingField(fieldKey);
-    setStatus(`Uploading ${fieldKey}...`);
+  async function handleUploadAll() {
+    setUploadingAll(true);
+    setError(null);
+    setStatus("Загрузка файлов...");
 
     try {
       const formData = new FormData();
-      formData.append("file", file);
+      for (const imageField of imageFields) {
+        const file = selectedFiles[imageField.key];
+        if (file) {
+          formData.append(imageField.key, file, file.name);
+        }
+      }
+      if (![...formData.keys()].length) {
+        const uiError = asUiError("E_UPLOAD_REQUIRED", "Выберите хотя бы одно фото для загрузки");
+        setError(uiError);
+        setStatus(`${uiError.message} (${uiError.code})`);
+        return;
+      }
 
-      const response = await fetch("/api/upload", {
+      const response = await fetch("/api/upload/batch", {
         method: "POST",
         body: formData
       });
-
-      const payload = (await response.json().catch(() => null)) as
-        | { error?: string }
-        | UploadResponse
-        | null;
-
+      const payload = (await response.json().catch(() => null)) as UploadBatchResponse | { error?: string; code?: string } | null;
       if (!response.ok) {
-        throw new Error(
-          payload && typeof payload === "object" && "error" in payload && payload.error
-            ? payload.error
-            : `Upload failed: ${response.status}`
-        );
+        const friendly = toUploadError(payload, response.status);
+        setError(friendly);
+        setStatus(`${friendly.message} (${friendly.code})`);
+        return;
+      }
+      if (!payload || typeof payload !== "object" || !("ok" in payload) || !payload.ok || !("objectKeys" in payload)) {
+        throw new Error("Invalid upload response");
       }
 
-      if (!payload || typeof payload !== "object" || !("objectKey" in payload)) {
-        throw new Error("Upload response has invalid format");
-      }
-
-      setFields((prev) => ({ ...prev, [fieldKey]: payload.objectKey }));
-      setUploadedImageUrls((prev) => ({ ...prev, [fieldKey]: payload.signedGetUrl }));
-      setStatus(`Uploaded ${fieldKey}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Upload failed";
-      setStatus(message);
+      setFields((prev) => ({ ...prev, ...payload.objectKeys }));
+      setStatus("Файлы загружены");
+    } catch (err) {
+      console.error("[upload batch]", err);
+      const friendly = asUiError("E_UPLOAD_FAILED", "Ошибка загрузки файлов");
+      setError(friendly);
+      setStatus(`${friendly.message} (${friendly.code})`);
     } finally {
-      setUploadingField(null);
+      setUploadingAll(false);
     }
   }
 
+  function validateBeforeGenerate(): UiError | null {
+    for (const field of textFields) {
+      const value = fields[field.key]?.trim() ?? "";
+      if (!value) return asUiError(`E_TEXT_REQUIRED_${field.key}`, `Заполните поле "${field.label}"`);
+    }
+    for (const field of imageFields) {
+      const value = fields[field.key]?.trim() ?? "";
+      if (!value) return asUiError(`E_PHOTO_REQUIRED_${field.key}`, `Загрузите фото для поля "${field.label}"`);
+    }
+    return null;
+  }
+
   async function handleGenerate() {
+    setError(null);
+    const validationError = validateBeforeGenerate();
+    if (validationError) {
+      setError(validationError);
+      setStatus(`${validationError.message} (${validationError.code})`);
+      return;
+    }
+
     setGenerating(true);
-    setDebugText("");
-    setStatus("Generating...");
+    setStatus("Создание изображения...");
 
     try {
-      const generatePayload = {
-        templateId: decodedId,
-        fields
-      };
-      if (process.env.NODE_ENV !== "production") {
-        console.log("[generate] payload", generatePayload);
-      }
-
       const response = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(generatePayload)
+        body: JSON.stringify({
+          templateId: decodedId,
+          fields
+        })
       });
 
-      const payload = (await response.json().catch(() => null)) as
-        | { error?: string }
-        | GenerateResponse
-        | null;
-
+      const payload = (await response.json().catch(() => null)) as GenerateResponse | { error?: string; code?: string } | null;
       if (!response.ok) {
-        throw new Error(
-          payload && typeof payload === "object" && "error" in payload && payload.error
-            ? payload.error
-            : `Generate failed: ${response.status}`
-        );
+        console.error("[generate] api error", payload);
+        const friendly = toGenerateError(payload);
+        setError(friendly);
+        setStatus(`${friendly.message} (${friendly.code})`);
+        return;
       }
-
-      if (!payload || typeof payload !== "object" || !("resultKey" in payload)) {
+      if (!payload || typeof payload !== "object" || !("signedGetUrl" in payload) || typeof payload.signedGetUrl !== "string") {
         throw new Error("Generate response has invalid format");
       }
 
-      setResultKey(payload.resultKey);
       setResultUrl(payload.signedGetUrl);
-      if (payload.debug) {
-        setDebugText(JSON.stringify(payload.debug, null, 2));
-      }
-      setStatus(`Done (${payload.renderMode ?? "unknown"})`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Generate failed";
-      setStatus(message);
+      setStatus("Изображение создано");
+    } catch (err) {
+      console.error("[generate]", err);
+      const friendly = asUiError("E_GENERATE_FAILED", "Не удалось создать изображение");
+      setError(friendly);
+      setStatus(`${friendly.message} (${friendly.code})`);
     } finally {
       setGenerating(false);
     }
@@ -197,94 +247,77 @@ export default function TemplateEditorPage({
   return (
     <main>
       <div className="card">
-        <h1>Template: {templateName}</h1>
-        <p className="muted">
-          ID: <code>{decodedId}</code>
-        </p>
-
+        <h1>{templateName}</h1>
         {status ? <p className="muted">{status}</p> : null}
-        {schemaError ? (
-          <div className="row">
-            <button type="button" onClick={() => void loadSchema()} disabled={loadingSchema}>
-              {loadingSchema ? "Retrying..." : "Retry"}
-            </button>
+
+        {error ? (
+          <div className="field-block">
+            <p className="muted" style={{ color: "#a30000" }}>
+              {error.message} ({error.code})
+            </p>
           </div>
         ) : null}
-        {!loadingSchema && schemaFields.length === 0 ? (
-          <p className="muted">0 editable fields for this template</p>
-        ) : null}
 
-        {schemaFields.map((field) => {
-          if (field.type === "text") {
-            return (
-              <div key={field.key} className="field-block">
-                <label htmlFor={field.key}>{field.label}</label>
-                <textarea
-                  id={field.key}
-                  rows={4}
-                  value={fields[field.key] ?? ""}
-                  onChange={(e) =>
-                    setFields((prev) => ({
-                      ...prev,
-                      [field.key]: e.target.value
-                    }))
-                  }
-                />
-              </div>
-            );
-          }
+        {loadingSchema ? <p className="muted">Загрузка...</p> : null}
 
-          return (
-            <form key={field.key} className="field-block" onSubmit={(e) => void handleUpload(field.key, e)}>
-              <label htmlFor={field.key}>{field.label}</label>
-              <input
-                id={field.key}
-                type="file"
-                accept="image/jpeg,image/png,image/webp"
-                onChange={(e) =>
-                  setSelectedFiles((prev) => ({
-                    ...prev,
-                    [field.key]: e.target.files?.[0] ?? null
-                  }))
-                }
-              />
-              <div className="row">
-                <button type="submit" disabled={uploadingField === field.key}>
-                  {uploadingField === field.key ? "Uploading..." : "Upload"}
-                </button>
-                {fields[field.key] ? <code>{fields[field.key]}</code> : null}
-              </div>
-              {uploadedImageUrls[field.key] ? (
-                <a href={uploadedImageUrls[field.key]} target="_blank" rel="noreferrer">
-                  Open uploaded image
-                </a>
-              ) : null}
-            </form>
-          );
-        })}
+        {textFields.map((field) => (
+          <div key={field.key} className="field-block">
+            <label htmlFor={field.key}>{field.label}</label>
+            <textarea
+              id={field.key}
+              rows={4}
+              value={fields[field.key] ?? ""}
+              onChange={(event) =>
+                setFields((prev) => ({
+                  ...prev,
+                  [field.key]: event.target.value
+                }))
+              }
+            />
+          </div>
+        ))}
+
+        {imageFields.map((field) => (
+          <div key={field.key} className="field-block">
+            <label htmlFor={field.key}>{field.label}</label>
+            <input
+              id={field.key}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              onChange={(event) =>
+                setSelectedFiles((prev) => ({
+                  ...prev,
+                  [field.key]: event.target.files?.[0] ?? null
+                }))
+              }
+            />
+            <p className="muted">
+              {fields[field.key]
+                ? "Файл загружен"
+                : selectedFiles[field.key]
+                  ? "Файл выбран, нажмите «Загрузить»"
+                  : "Файл не выбран"}
+            </p>
+          </div>
+        ))}
 
         <div className="row">
-          <button type="button" onClick={handleGenerate} disabled={!canGenerate}>
-            {generating ? "Generating..." : "Generate"}
+          <button type="button" onClick={() => void handleUploadAll()} disabled={!canUpload}>
+            {uploadingAll ? "Загрузка..." : "Загрузить"}
           </button>
+          <button type="button" onClick={() => void handleGenerate()} disabled={!canGenerate}>
+            {generating ? "Создание..." : "Создать изображение"}
+          </button>
+          {resultUrl ? (
+            <button type="button" onClick={() => window.open(resultUrl, "_blank", "noopener,noreferrer")}>
+              Скачать макет
+            </button>
+          ) : null}
         </div>
 
-        {resultKey ? (
+        {resultUrl ? (
           <div className="field-block">
-            <p>
-              Render: <code>{resultKey}</code>{" "}
-              <a href={resultUrl} target="_blank" rel="noreferrer">
-                Open
-              </a>
-            </p>
-            <img src={resultUrl} alt="Render result" style={{ maxWidth: "100%", borderRadius: 12 }} />
-          </div>
-        ) : null}
-
-        {debugText ? (
-          <div className="field-block">
-            <p>Debug</p>
-            <pre style={{ overflowX: "auto", whiteSpace: "pre-wrap", fontSize: 12 }}>{debugText}</pre>
+            <img src={resultUrl} alt="Готовый макет" style={{ maxWidth: "100%", borderRadius: 12 }} />
           </div>
         ) : null}
       </div>

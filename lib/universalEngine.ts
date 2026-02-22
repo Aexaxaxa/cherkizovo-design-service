@@ -2,16 +2,15 @@ import path from "node:path";
 import sharp from "sharp";
 import {
   buildLayoutTree,
-  containerMaxContentWidth,
   findNearestResizableContainer,
   getEditableKind,
   hasSolidFill,
-  isExplicitWidth,
   type FigmaNodeLite,
   type LayoutNode
 } from "@/lib/figmaLayout";
 import { buildRoundedRectPath } from "@/lib/roundedRectPath";
 import { getObject } from "@/lib/s3";
+import { toSafeFrameId } from "@/lib/snapshotStore";
 import { streamToBuffer } from "@/lib/streamToBuffer";
 import {
   buildSvgPathsForLines,
@@ -66,6 +65,21 @@ export type UniversalRenderDebug = {
     lines: number;
     textH: number;
   }>;
+  badBoxes?: Array<{
+    label: string;
+    box: { left: number; top: number; width: number; height: number } | null;
+  }>;
+  skippedPhoto?: boolean;
+  skippedPhotoReason?: string[];
+  photoLayers?: Array<{
+    name: string;
+    targetW: number;
+    targetH: number;
+    actualW: number;
+    actualH: number;
+    left: number;
+    top: number;
+  }>;
 };
 
 export type UniversalRenderResult = {
@@ -81,8 +95,32 @@ type Layer = {
   height: number;
   input: Buffer;
 };
+type CompositeItem = {
+  input: Buffer;
+  left: number;
+  top: number;
+  width?: number;
+  height?: number;
+  blend?: sharp.Blend;
+};
 
 type EditableTextDebug = UniversalRenderDebug["editables"][number];
+type SafeBox = { left: number; top: number; width: number; height: number };
+type MeasuredTextBlock = {
+  node: LayoutNode;
+  lines: string[];
+  lineWidthsPx: number[];
+  maxLineWidthPx: number;
+  textBlockHeightPx: number;
+  lineHeightPx: number;
+  letterSpacing: number;
+  fontSize: number;
+  font: Awaited<ReturnType<typeof loadFontCached>>;
+  metrics: ReturnType<typeof getFontMetricsPx>;
+  textAlignHorizontal: "LEFT" | "CENTER" | "RIGHT";
+  color: { r: number; g: number; b: number; a: number };
+};
+type LayoutBox = { x: number; y: number; width: number; height: number };
 
 const ATOMIC_IMAGE_TYPES = new Set([
   "VECTOR",
@@ -100,6 +138,15 @@ const ATOMIC_IMAGE_TYPES = new Set([
 ]);
 
 const FONT_BY_POSTSCRIPT: Record<string, string> = {
+  "gothampro": "gothampro.ttf",
+  "gothampro-regular": "gothampro.ttf",
+  "gothampro-medium": "gothampro_medium.ttf",
+  "gothampro-bold": "gothampro_bold.ttf",
+  "gothampro-black": "gothampro_black.ttf",
+  "gothampro-italic": "gothampro_italic.ttf",
+  "gothampro-mediumitalic": "gothampro_mediumitalic.ttf",
+  "gothampro-bolditalic": "gothampro_bolditalic.ttf",
+  "gothampro-blackitalic": "gothampro_blackitalic.ttf",
   "GothamPro-Bold": "gothampro_bold.ttf",
   "GothamPro-Regular": "gothampro.ttf",
   "GothamPro-Medium": "gothampro_medium.ttf"
@@ -125,6 +172,120 @@ function ensureLayerGeometry(value: number, fallback: number): number {
   return Math.max(fallback, Math.round(value));
 }
 
+function sanitizeBox(
+  box: { left: number; top: number; width: number; height: number } | null,
+  frameW: number,
+  frameH: number,
+  label: string,
+  badBoxes?: Array<{ label: string; box: SafeBox | null }>
+): SafeBox | null {
+  if (!box) {
+    badBoxes?.push({ label, box: null });
+    if (process.env.DEBUG_RENDER === "1") {
+      console.warn(`[universalEngine] Invalid box(${label}): null`);
+    }
+    return null;
+  }
+  const { left, top, width, height } = box;
+  const valuesFinite = [left, top, width, height].every((v) => Number.isFinite(v));
+  const widthOk = width >= 1 && width <= Math.min(frameW * 4, 12000);
+  const heightOk = height >= 1 && height <= Math.min(frameH * 4, 12000);
+  const posOk = left >= -frameW * 2 && top >= -frameH * 2;
+  const areaOk = width * height <= 200_000_000;
+  if (!valuesFinite || !widthOk || !heightOk || !posOk || !areaOk) {
+    const bad = { left, top, width, height };
+    badBoxes?.push({ label, box: bad });
+    if (process.env.DEBUG_RENDER === "1") {
+      console.warn(`[universalEngine] Invalid box(${label})`, { box: bad, frameW, frameH });
+    }
+    return null;
+  }
+  return {
+    left: Math.round(left),
+    top: Math.round(top),
+    width: Math.round(width),
+    height: Math.round(height)
+  };
+}
+
+async function normalizeCompositeItem(
+  baseW: number,
+  baseH: number,
+  item: CompositeItem,
+  label: string,
+  badBoxes: Array<{ label: string; box: SafeBox | null }>
+): Promise<CompositeItem | null> {
+  const meta = await sharp(item.input).metadata();
+  const ow = meta.width ?? 0;
+  const oh = meta.height ?? 0;
+  if (ow <= 0 || oh <= 0) {
+    badBoxes.push({ label: `${label}:empty-overlay`, box: null });
+    return null;
+  }
+
+  let left = Math.round(item.left);
+  let top = Math.round(item.top);
+  let w = Math.round(item.width ?? ow);
+  let h = Math.round(item.height ?? oh);
+  const safe = sanitizeBox({ left, top, width: w, height: h }, baseW, baseH, `${label}:intended`, badBoxes);
+  if (!safe) return null;
+  left = safe.left;
+  top = safe.top;
+  w = safe.width;
+  h = safe.height;
+
+  let overlay = item.input;
+  if (ow !== w || oh !== h) {
+    overlay = await sharp(overlay).resize(w, h, { fit: "fill" }).png().toBuffer();
+  }
+
+  const interLeft = Math.max(left, 0);
+  const interTop = Math.max(top, 0);
+  const interRight = Math.min(left + w, baseW);
+  const interBottom = Math.min(top + h, baseH);
+  const interW = interRight - interLeft;
+  const interH = interBottom - interTop;
+  if (interW <= 0 || interH <= 0) {
+    return null;
+  }
+
+  if (interW !== w || interH !== h) {
+    const cropX = interLeft - left;
+    const cropY = interTop - top;
+    overlay = await sharp(overlay)
+      .extract({
+        left: Math.max(0, Math.round(cropX)),
+        top: Math.max(0, Math.round(cropY)),
+        width: Math.max(1, Math.round(interW)),
+        height: Math.max(1, Math.round(interH))
+      })
+      .png()
+      .toBuffer();
+    left = interLeft;
+    top = interTop;
+    w = interW;
+    h = interH;
+  }
+
+  const meta2 = await sharp(overlay).metadata();
+  if ((meta2.width ?? 0) > baseW || (meta2.height ?? 0) > baseH) {
+    badBoxes.push({
+      label: `${label}:overlay-too-large`,
+      box: { left, top, width: meta2.width ?? 0, height: meta2.height ?? 0 }
+    });
+    return null;
+  }
+
+  return {
+    ...item,
+    input: overlay,
+    left,
+    top,
+    width: w,
+    height: h
+  };
+}
+
 function rgbaToCss(fill: { r: number; g: number; b: number; a: number }): string {
   const r = Math.round(clamp(fill.r, 0, 1) * 255);
   const g = Math.round(clamp(fill.g, 0, 1) * 255);
@@ -143,6 +304,27 @@ function toRelativeBbox(node: LayoutNode, frameX: number, frameY: number) {
   };
 }
 
+function offsetRelativeBbox(
+  bbox: { x: number; y: number; width: number; height: number } | null,
+  offsetX: number,
+  offsetY: number
+) {
+  if (!bbox) return null;
+  return {
+    x: bbox.x + offsetX,
+    y: bbox.y + offsetY,
+    width: bbox.width,
+    height: bbox.height
+  };
+}
+
+function isFixedContainer(node: LayoutNode | undefined): boolean {
+  if (!node) return false;
+  if (node.layoutSizingHorizontal === "FIXED" || node.counterAxisSizingMode === "FIXED") return true;
+  if (node.layoutSizingVertical === "FIXED" || node.primaryAxisSizingMode === "FIXED") return true;
+  return false;
+}
+
 function getRadii(node: LayoutNode): [number, number, number, number] {
   return node.radii ?? [0, 0, 0, 0];
 }
@@ -151,31 +333,65 @@ function getPrimaryFill(node: LayoutNode): { r: number; g: number; b: number; a:
   return node.fills[0];
 }
 
-function resolveFontPath(fontPostScriptName: string | undefined): string {
-  const fileName = fontPostScriptName ? FONT_BY_POSTSCRIPT[fontPostScriptName] : undefined;
-  if (!fileName) {
-    if (fontPostScriptName) {
-      console.warn(`Unknown fontPostScriptName: ${fontPostScriptName}. Falling back to GothamPro-Bold`);
-    }
-    return path.join(process.cwd(), "assets", "fonts", "gothampro", "gothampro_bold.ttf");
+function resolveFontPath(style: LayoutNode["textStyle"] | undefined): string {
+  const postScript = style?.fontPostScriptName?.trim();
+  const lowerPostScript = postScript?.toLowerCase();
+  const fromPostScript =
+    (postScript ? FONT_BY_POSTSCRIPT[postScript] : undefined) ||
+    (lowerPostScript ? FONT_BY_POSTSCRIPT[lowerPostScript] : undefined);
+  if (fromPostScript) {
+    return path.join(process.cwd(), "assets", "fonts", "gothampro", fromPostScript);
   }
-  return path.join(process.cwd(), "assets", "fonts", "gothampro", fileName);
+
+  const family = style?.fontFamily?.toLowerCase() ?? "";
+  const weight = style?.fontWeight ?? 400;
+  const isItalic = lowerPostScript?.includes("italic") ?? false;
+  if (family.includes("gotham")) {
+    if (weight >= 800) {
+      return path.join(process.cwd(), "assets", "fonts", "gothampro", isItalic ? "gothampro_blackitalic.ttf" : "gothampro_black.ttf");
+    }
+    if (weight >= 700) {
+      return path.join(process.cwd(), "assets", "fonts", "gothampro", isItalic ? "gothampro_bolditalic.ttf" : "gothampro_bold.ttf");
+    }
+    if (weight >= 500) {
+      return path.join(process.cwd(), "assets", "fonts", "gothampro", isItalic ? "gothampro_mediumitalic.ttf" : "gothampro_medium.ttf");
+    }
+    return path.join(process.cwd(), "assets", "fonts", "gothampro", isItalic ? "gothampro_italic.ttf" : "gothampro.ttf");
+  }
+
+  if (postScript) {
+    console.warn(`Unknown fontPostScriptName: ${postScript}. Falling back to GothamPro-Bold`);
+  }
+  return path.join(process.cwd(), "assets", "fonts", "gothampro", "gothampro_bold.ttf");
 }
 
 async function createSolidRectLayer(
   node: LayoutNode,
   frameX: number,
   frameY: number,
+  frameW: number,
+  frameH: number,
+  badBoxes: Array<{ label: string; box: SafeBox | null }>,
+  offsetX = 0,
+  offsetY = 0,
   forceBbox?: { x: number; y: number; width: number; height: number }
 ): Promise<Layer | null> {
-  const bbox = forceBbox ?? toRelativeBbox(node, frameX, frameY);
+  const baseBbox = forceBbox ?? toRelativeBbox(node, frameX, frameY);
+  const raw = offsetRelativeBbox(baseBbox, offsetX, offsetY);
+  const bbox = sanitizeBox(
+    raw ? { left: raw.x, top: raw.y, width: raw.width, height: raw.height } : null,
+    frameW,
+    frameH,
+    `solid:${node.name}:${node.id}`,
+    badBoxes
+  );
   if (!bbox) return null;
 
   const fill = getPrimaryFill(node);
   if (!fill) return null;
 
-  const width = ensureLayerGeometry(bbox.width, 1);
-  const height = ensureLayerGeometry(bbox.height, 1);
+  const width = bbox.width;
+  const height = bbox.height;
   const effectiveAlpha = clamp(fill.a * node.opacity, 0, 1);
   const cssFill = rgbaToCss({ ...fill, a: effectiveAlpha });
   const radii = getRadii(node);
@@ -186,8 +402,8 @@ async function createSolidRectLayer(
 
   return {
     nodeId: node.id,
-    left: toInt(bbox.x),
-    top: toInt(bbox.y),
+    left: bbox.left,
+    top: bbox.top,
     width,
     height,
     input: await sharp(svg).png().toBuffer()
@@ -214,6 +430,18 @@ async function getSnapshotAssetBuffer(assetKey: string, cache: Map<string, Buffe
   return buffer;
 }
 
+function isObjectNotFoundError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  if ("$metadata" in error && typeof error.$metadata === "object" && error.$metadata) {
+    const metadata = error.$metadata as { httpStatusCode?: number };
+    if (metadata.httpStatusCode === 404) return true;
+  }
+  if ("name" in error && typeof error.name === "string") {
+    return error.name === "NoSuchKey" || error.name === "NotFound";
+  }
+  return false;
+}
+
 async function applyOpacityToPng(input: Buffer, opacity: number): Promise<Buffer> {
   const normalized = clamp(opacity, 0, 1);
   if (normalized >= 0.999) return input;
@@ -237,18 +465,37 @@ async function renderEditablePhoto(
   fields: Record<string, string>,
   frameX: number,
   frameY: number,
-  fieldsUsed: Set<string>
-): Promise<Layer | null> {
+  frameW: number,
+  frameH: number,
+  fieldsUsed: Set<string>,
+  badBoxes: Array<{ label: string; box: SafeBox | null }>,
+  markPhotoSkipped: (reason: string) => void,
+  computedBox?: LayoutBox,
+  offsetX = 0,
+  offsetY = 0
+): Promise<{ layer: Layer | null; photoDebug?: NonNullable<UniversalRenderDebug["photoLayers"]>[number] }> {
   const objectKey = fields[node.name];
-  if (!objectKey || !node.bbox) return null;
+  if (!objectKey || !node.bbox) return { layer: null };
 
   fieldsUsed.add(node.name);
 
-  const rel = toRelativeBbox(node, frameX, frameY);
-  if (!rel) return null;
+  const rawRel = computedBox
+    ? { x: computedBox.x, y: computedBox.y, width: computedBox.width, height: computedBox.height }
+    : offsetRelativeBbox(toRelativeBbox(node, frameX, frameY), offsetX, offsetY);
+  const rel = sanitizeBox(
+    rawRel ? { left: rawRel.x, top: rawRel.y, width: rawRel.width, height: rawRel.height } : null,
+    frameW,
+    frameH,
+    `photo:${node.name}:${node.id}`,
+    badBoxes
+  );
+  if (!rel) {
+    markPhotoSkipped(`invalid-photo-box:${node.id}`);
+    return { layer: null };
+  }
 
-  const width = ensureLayerGeometry(rel.width, 1);
-  const height = ensureLayerGeometry(rel.height, 1);
+  const width = rel.width;
+  const height = rel.height;
   const source = await getUploadBuffer(objectKey);
   const radii = getRadii(node);
   const pathData = buildRoundedRectPath(width, height, radii);
@@ -273,13 +520,37 @@ async function renderEditablePhoto(
     .png()
     .toBuffer();
 
-  return {
+  const finalLayer: Layer = {
     nodeId: node.id,
-    left: toInt(rel.x),
-    top: toInt(rel.y),
+    left: rel.left,
+    top: rel.top,
     width,
     height,
     input
+  };
+  const finalMeta = await sharp(input).metadata();
+  if (process.env.DEBUG_RENDER === "1") {
+    console.warn("[universalEngine] photo-layer", {
+      name: node.name,
+      targetW: width,
+      targetH: height,
+      actualW: finalMeta.width ?? 0,
+      actualH: finalMeta.height ?? 0,
+      left: rel.left,
+      top: rel.top
+    });
+  }
+  return {
+    layer: finalLayer,
+    photoDebug: {
+      name: node.name,
+      targetW: width,
+      targetH: height,
+      actualW: finalMeta.width ?? 0,
+      actualH: finalMeta.height ?? 0,
+      left: finalLayer.left,
+      top: finalLayer.top
+    }
   };
 }
 
@@ -307,29 +578,33 @@ function clampLinesByHeight(
   return lines.slice(0, Math.max(1, maxLines));
 }
 
-async function renderEditableText(
-  node: LayoutNode,
-  treeById: Map<string, LayoutNode>,
-  fields: Record<string, string>,
-  frameX: number,
-  frameY: number,
-  frameW: number,
-  frameH: number,
-  fieldsUsed: Set<string>,
-  forcedContainer?: LayoutNode
-): Promise<{ layer: Layer | null; debug?: EditableTextDebug }> {
-  if (!node.bbox) return { layer: null };
-
-  const rawText = fields[node.name] ?? "";
+function getEditableTextValue(node: LayoutNode, fields: Record<string, string>, fieldsUsed: Set<string>): string {
+  let base: string;
   if (Object.prototype.hasOwnProperty.call(fields, node.name)) {
     fieldsUsed.add(node.name);
+    base = fields[node.name] ?? "";
+  } else {
+    base = node.characters ?? "";
   }
 
-  const container = forcedContainer ?? findNearestResizableContainer(node, treeById);
-  const target = container ?? node;
-  const rel = toRelativeBbox(target, frameX, frameY);
-  if (!rel) return { layer: null };
+  if (node.name.toLowerCase() === "text_quote") {
+    let t = base.trim();
+    const hadTrailingDot = t.endsWith(".");
+    if (t.endsWith(".")) {
+      t = t.slice(0, -1).trimEnd();
+    }
+    const hasStrongEnding = t.endsWith("!") || t.endsWith("?");
+    const suffix = hadTrailingDot && !hasStrongEnding ? "." : "";
+    return `\u2014\u00A0\u00AB${t}\u00BB${suffix}`;
+  }
+  return base;
+}
 
+async function measureTextBlock(
+  node: LayoutNode,
+  rawText: string,
+  maxTextWidth: number
+): Promise<MeasuredTextBlock> {
   const style = node.textStyle ?? {};
   const fontSize = style.fontSize && style.fontSize > 0 ? style.fontSize : 16;
   const lineHeightPx =
@@ -337,9 +612,108 @@ async function renderEditableText(
       ? style.lineHeightPx
       : typeof style.lineHeightPercentFontSize === "number" && style.lineHeightPercentFontSize > 0
         ? fontSize * (style.lineHeightPercentFontSize / 100)
+        : typeof style.lineHeightPercent === "number" && style.lineHeightPercent > 0
+          ? fontSize * (style.lineHeightPercent / 100)
         : fontSize;
-
   const letterSpacing = typeof style.letterSpacing === "number" ? style.letterSpacing : 0;
+  const fontPath = resolveFontPath(style);
+  const font = await loadFontCached(fontPath);
+  const metrics = getFontMetricsPx(font, fontSize);
+  const lines = wrapTextByWords(rawText, maxTextWidth, font, fontSize, letterSpacing);
+  const safeLines = lines.length > 0 ? lines : [""];
+  const lineWidthsPx = safeLines.map((line) => measureTextPx(line, font, fontSize, letterSpacing));
+  const maxLineWidthPx = lineWidthsPx.reduce((maxWidth, lineWidth) => Math.max(maxWidth, lineWidth), 0);
+  const textAlignHorizontal =
+    style.textAlignHorizontal === "CENTER" || style.textAlignHorizontal === "RIGHT" ? style.textAlignHorizontal : "LEFT";
+  const textBlockHeightPx = (safeLines.length - 1) * lineHeightPx + (metrics.ascPx + metrics.descPx);
+  return {
+    node,
+    lines: safeLines,
+    lineWidthsPx,
+    maxLineWidthPx,
+    textBlockHeightPx,
+    lineHeightPx,
+    letterSpacing,
+    fontSize,
+    font,
+    metrics,
+    textAlignHorizontal,
+    color: getPrimaryFill(node) ?? { r: 0, g: 0, b: 0, a: 1 }
+  };
+}
+
+function getAlignedLineStartX(
+  align: "LEFT" | "CENTER" | "RIGHT",
+  innerLeft: number,
+  innerWidth: number,
+  lineWidth: number
+): number {
+  if (align === "CENTER") {
+    return innerLeft + (innerWidth - lineWidth) / 2;
+  }
+  if (align === "RIGHT") {
+    return innerLeft + (innerWidth - lineWidth);
+  }
+  return innerLeft;
+}
+
+function buildAlignedTextPaths(
+  item: MeasuredTextBlock,
+  innerLeft: number,
+  innerWidth: number,
+  firstBaselineY: number
+): string {
+  let out = "";
+  for (let lineIndex = 0; lineIndex < item.lines.length; lineIndex += 1) {
+    const line = item.lines[lineIndex];
+    if (!line) continue;
+    const baselineY = firstBaselineY + lineIndex * item.lineHeightPx;
+    const lineWidth = item.lineWidthsPx[lineIndex] ?? 0;
+    const lineStartX = getAlignedLineStartX(item.textAlignHorizontal, innerLeft, innerWidth, lineWidth);
+    out += buildSvgPathsForLines(item.font, [line], lineStartX, baselineY, item.fontSize, item.lineHeightPx);
+  }
+  return out;
+}
+
+function getManualAssetType(name: string): "sticker" | "marks" | null {
+  const normalized = name.trim().toLowerCase();
+  if (normalized === "sticker") return "sticker";
+  if (normalized === "marks") return "marks";
+  return null;
+}
+
+async function renderEditableText(
+  nodes: LayoutNode[],
+  treeById: Map<string, LayoutNode>,
+  fields: Record<string, string>,
+  frameX: number,
+  frameY: number,
+  frameW: number,
+  frameH: number,
+  fieldsUsed: Set<string>,
+  badBoxes: Array<{ label: string; box: SafeBox | null }>,
+  forcedContainer?: LayoutNode,
+  computedContainerBox?: LayoutBox,
+  computedBoxes?: Map<string, LayoutBox>
+): Promise<{ layer: Layer | null; debug?: EditableTextDebug }> {
+  if (nodes.length === 0) return { layer: null };
+  const node = nodes[0];
+  if (!node.bbox) return { layer: null };
+
+  const container = forcedContainer ?? findNearestResizableContainer(node, treeById);
+  const target = container ?? node;
+  const rawRel = computedContainerBox
+    ? { x: computedContainerBox.x, y: computedContainerBox.y, width: computedContainerBox.width, height: computedContainerBox.height }
+    : toRelativeBbox(target, frameX, frameY);
+  const safeRel = sanitizeBox(
+    rawRel ? { left: rawRel.x, top: rawRel.y, width: rawRel.width, height: rawRel.height } : null,
+    frameW,
+    frameH,
+    `text-container:${target.name}:${target.id}`,
+    badBoxes
+  );
+  if (!safeRel) return { layer: null };
+  const rel = { x: safeRel.left, y: safeRel.top, width: safeRel.width, height: safeRel.height };
 
   const paddingLeft = container ? container.paddingLeft ?? 0 : 0;
   const paddingRight = container ? container.paddingRight ?? 0 : 0;
@@ -351,60 +725,107 @@ async function renderEditableText(
   const origW = Math.max(1, rel.width);
   const origH = Math.max(1, rel.height);
 
-  const explicitMaxContentWidth = container ? containerMaxContentWidth(container) : undefined;
-  const frameLimit = Math.max(1, frameW - origX - paddingLeft - paddingRight);
-  const containerWidth = container?.bbox?.width ?? origW;
-  const isFixedWidth = Boolean(container && explicitMaxContentWidth !== undefined);
-  let maxTextWidth = isFixedWidth
-    ? Math.max(1, containerWidth - paddingLeft - paddingRight)
-    : Math.max(1, Math.min(frameLimit, 1600));
-
-  const fontPath = resolveFontPath(style.fontPostScriptName);
-  const font = await loadFontCached(fontPath);
-  const metrics = getFontMetricsPx(font, fontSize);
-
-  let lines = wrapTextByWords(rawText, maxTextWidth, font, fontSize, letterSpacing);
-  if (lines.length === 0) lines = [""];
-
-  let maxLineWidthPx = lines.reduce((maxWidth, line) => {
-    return Math.max(maxWidth, measureTextPx(line, font, fontSize, letterSpacing));
-  }, 0);
-
-  let textBoxWidth = Math.max(1, Math.min(maxTextWidth, maxLineWidthPx));
-  let blockW = container
-    ? isFixedWidth
-      ? Math.max(1, containerWidth)
-      : textBoxWidth + paddingLeft + paddingRight
-    : origW;
-
-  let textBlockHeightPx = (lines.length - 1) * lineHeightPx + (metrics.ascPx + metrics.descPx);
-  let blockH = container ? paddingTop + textBlockHeightPx + paddingBottom : origH;
-
   const constraintH = (container?.constraints?.horizontal ?? node.constraints?.horizontal ?? "LEFT") as string;
   const constraintV = (container?.constraints?.vertical ?? node.constraints?.vertical ?? "TOP") as string;
+
+  const rawTexts = nodes.map((textNode) => getEditableTextValue(textNode, fields, fieldsUsed));
+  const nodeWrapWidths = nodes.map((textNode) => {
+    const childBox = computedBoxes?.get(textNode.id);
+    return childBox ? Math.max(1, childBox.width) : undefined;
+  });
+  const marginSafe = 150;
+  const eps = 2;
+  const isFixed = isFixedContainer(container);
+  let anchor: "left" | "right" | "center" | "free" = "free";
+  if (container) {
+    const constraintHorizontal = container.constraints?.horizontal ?? node.constraints?.horizontal;
+    if (constraintHorizontal === "CENTER") {
+      anchor = "center";
+    } else if (constraintHorizontal === "LEFT") {
+      anchor = "left";
+    } else if (constraintHorizontal === "RIGHT") {
+      anchor = "right";
+    } else if (Math.abs(rel.x - 0) <= eps) {
+      anchor = "left";
+    } else if (Math.abs(rel.x + rel.width - frameW) <= eps) {
+      anchor = "right";
+    } else if (Math.abs(rel.x + rel.width / 2 - frameW / 2) <= 4) {
+      anchor = "center";
+    } else {
+      anchor = "free";
+    }
+  }
+
+  const maxWForAnchor = container
+    ? anchor === "center"
+      ? Math.max(1, frameW - marginSafe * 2)
+      : Math.max(1, frameW - marginSafe)
+    : Math.max(1, origW);
+  let maxTextWidth = container
+    ? Math.max(1, (isFixed ? origW : maxWForAnchor) - paddingLeft - paddingRight)
+    : Math.max(1, origW);
+  let measured = await Promise.all(
+    nodes.map((textNode, index) => {
+      const wrapW = nodeWrapWidths[index] ?? maxTextWidth;
+      return measureTextBlock(textNode, rawTexts[index], Math.max(1, Math.min(maxTextWidth, wrapW)));
+    })
+  );
+
+  let measuredTextW = measured.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
+  let blockW = container
+    ? isFixed
+      ? origW
+      : clamp(measuredTextW + paddingLeft + paddingRight, 1, maxWForAnchor)
+    : origW;
+
+  if (container && !isFixed) {
+    maxTextWidth = Math.max(1, blockW - paddingLeft - paddingRight);
+    measured = await Promise.all(
+      nodes.map((textNode, index) => {
+        const wrapW = nodeWrapWidths[index] ?? maxTextWidth;
+        return measureTextBlock(textNode, rawTexts[index], Math.max(1, Math.min(maxTextWidth, wrapW)));
+      })
+    );
+    measuredTextW = measured.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
+    blockW = clamp(measuredTextW + paddingLeft + paddingRight, 1, maxWForAnchor);
+  }
+
+  const isAutoLayoutContainer = Boolean(container && container.layoutMode && container.layoutMode !== "NONE");
+  const itemSpacing = container ? (Number.isFinite(container.itemSpacing) ? (container.itemSpacing as number) : 50) : 0;
+  const textBlockHeightPx = isAutoLayoutContainer
+    ? measured.reduce((sum, item) => sum + item.textBlockHeightPx, 0) + Math.max(0, measured.length - 1) * itemSpacing
+    : measured.length > 0
+      ? measured[0].textBlockHeightPx
+      : 0;
+  let blockH = container ? (isFixed ? origH : paddingTop + textBlockHeightPx + paddingBottom) : origH;
 
   let newX = origX;
   let newY = origY;
 
-  if (constraintH === "RIGHT") {
+  if (container && !isFixed) {
+    if (anchor === "left") {
+      newX = 0;
+    } else if (anchor === "right") {
+      newX = frameW - blockW;
+      if (newX < marginSafe) {
+        newX = marginSafe;
+      }
+    } else if (anchor === "center") {
+      newX = Math.round(frameW / 2 - blockW / 2);
+    } else {
+      newX = origX;
+    }
+  } else if (container && isFixed) {
+    newX = origX;
+  } else if (constraintH === "RIGHT") {
     newX = origX + origW - blockW;
   } else if (constraintH === "CENTER") {
     newX = origX + origW / 2 - blockW / 2;
-  } else if (constraintH === "LEFT_RIGHT") {
-    newX = origX;
-    blockW = origW;
-    textBoxWidth = Math.max(1, origW - paddingLeft - paddingRight);
-    maxTextWidth = textBoxWidth;
-    lines = wrapTextByWords(rawText, textBoxWidth, font, fontSize, letterSpacing);
-    if (lines.length === 0) lines = [""];
-    textBlockHeightPx = (lines.length - 1) * lineHeightPx + (metrics.ascPx + metrics.descPx);
-    blockH = container ? paddingTop + textBlockHeightPx + paddingBottom : origH;
-    maxLineWidthPx = lines.reduce((maxWidth, line) => {
-      return Math.max(maxWidth, measureTextPx(line, font, fontSize, letterSpacing));
-    }, 0);
   }
 
-  if (constraintV === "BOTTOM") {
+  if (container && isFixed) {
+    newY = origY;
+  } else if (constraintV === "BOTTOM") {
     newY = origY + origH - blockH;
   } else if (constraintV === "CENTER") {
     newY = origY + origH / 2 - blockH / 2;
@@ -412,8 +833,18 @@ async function renderEditableText(
     newY = origY;
     blockH = origH;
     const contentHeight = Math.max(1, blockH - paddingTop - paddingBottom);
-    lines = clampLinesByHeight(lines, contentHeight, lineHeightPx, metrics.ascPx, metrics.descPx);
-    textBlockHeightPx = (lines.length - 1) * lineHeightPx + (metrics.ascPx + metrics.descPx);
+    if (measured.length > 0) {
+      const first = measured[0];
+      first.lines = clampLinesByHeight(
+        first.lines,
+        contentHeight,
+        first.lineHeightPx,
+        first.metrics.ascPx,
+        first.metrics.descPx
+      );
+      first.textBlockHeightPx =
+        (first.lines.length - 1) * first.lineHeightPx + (first.metrics.ascPx + first.metrics.descPx);
+    }
   }
 
   blockW = Math.max(1, blockW);
@@ -425,12 +856,46 @@ async function renderEditableText(
   const innerTop = paddingTop;
   const innerBottom = blockH - paddingBottom;
   const innerHeight = Math.max(1, innerBottom - innerTop);
-  const textTopY = innerTop + Math.max(0, (innerHeight - textBlockHeightPx) / 2);
-  const baselineY = textTopY + metrics.ascPx;
-  const textX = paddingLeft;
+  const innerWidth = Math.max(1, blockW - paddingLeft - paddingRight);
+  const contentHeight = isAutoLayoutContainer
+    ? measured.reduce((sum, item) => sum + item.textBlockHeightPx, 0) + Math.max(0, measured.length - 1) * itemSpacing
+    : measured.length > 0
+      ? measured[0].textBlockHeightPx
+      : 0;
+  const contentTop = innerTop + Math.max(0, (innerHeight - contentHeight) / 2);
 
-  const textColor = getPrimaryFill(node) ?? { r: 0, g: 0, b: 0, a: 1 };
-  const textPaths = buildSvgPathsForLines(font, lines, textX, baselineY, fontSize, lineHeightPx);
+  if (process.env.DEBUG_RENDER === "1" && container) {
+    console.warn("[universalEngine] pill-content-center", {
+      pillName: container.name || node.name,
+      pillH: blockH,
+      paddingTop,
+      paddingBottom,
+      innerH: innerHeight,
+      contentHeight,
+      contentTop
+    });
+  }
+
+  let textPaths = "";
+  if (isAutoLayoutContainer && measured.length > 0) {
+    let cursorY = contentTop;
+    for (const item of measured) {
+      const childBox = computedBoxes?.get(item.node.id);
+      const textTopY = cursorY;
+      const baselineY = textTopY + item.metrics.ascPx;
+      const itemInnerLeft = childBox ? Math.max(paddingLeft, childBox.x - newX) : paddingLeft;
+      const itemInnerWidth = childBox ? Math.max(1, childBox.width) : innerWidth;
+      const paths = buildAlignedTextPaths(item, itemInnerLeft, itemInnerWidth, baselineY);
+      textPaths += `<g fill="${rgbaToCss(item.color)}">${paths}</g>`;
+      cursorY += item.textBlockHeightPx + itemSpacing;
+    }
+  } else if (measured.length > 0) {
+    const item = measured[0];
+    const textTopY = contentTop;
+    const baselineY = textTopY + item.metrics.ascPx;
+    const paths = buildAlignedTextPaths(item, paddingLeft, innerWidth, baselineY);
+    textPaths = `<g fill="${rgbaToCss(item.color)}">${paths}</g>`;
+  }
 
   const width = ensureLayerGeometry(blockW, 1);
   const height = ensureLayerGeometry(blockH, 1);
@@ -442,7 +907,7 @@ async function renderEditableText(
       (containerFill
         ? `<path d="${containerPath}" fill="${rgbaToCss({ ...containerFill, a: containerFill.a * (container?.opacity ?? 1) })}"/>`
         : "") +
-      `<g fill="${rgbaToCss(textColor)}">${textPaths}</g>` +
+      textPaths +
       `</svg>`
   );
 
@@ -454,6 +919,21 @@ async function renderEditableText(
     height,
     input: await sharp(svg).png().toBuffer()
   };
+
+  const safeLayerBox = sanitizeBox(
+    { left: layer.left, top: layer.top, width: layer.width, height: layer.height },
+    frameW,
+    frameH,
+    `text-layer:${node.name}:${node.id}`,
+    badBoxes
+  );
+  if (!safeLayerBox) {
+    return { layer: null };
+  }
+  layer.left = safeLayerBox.left;
+  layer.top = safeLayerBox.top;
+  layer.width = safeLayerBox.width;
+  layer.height = safeLayerBox.height;
 
   return {
     layer,
@@ -474,15 +954,13 @@ async function renderEditableText(
       constraintH,
       constraintV,
       origW: Math.max(1, Math.round(origW)),
-      isExplicitWidth: container ? isExplicitWidth(container) : false,
-      isFixedWidth,
-      containerW: Math.max(1, Math.round(containerWidth)),
+      isExplicitWidth: false,
+      isFixedWidth: isFixed,
+      containerW: Math.max(1, Math.round(container?.bbox?.width ?? origW)),
       paddingL: Math.max(0, Math.round(paddingLeft)),
       paddingR: Math.max(0, Math.round(paddingRight)),
-      explicitMaxContentWidth:
-        typeof explicitMaxContentWidth === "number" ? Math.max(1, Math.round(explicitMaxContentWidth)) : undefined,
       maxTextWidth: Math.max(1, Math.round(maxTextWidth)),
-      linesCount: lines.length,
+      linesCount: measured.reduce((sum, item) => sum + item.lines.length, 0),
       finalBlockW: width,
       textH: Math.max(1, Math.round(textBlockHeightPx))
     }
@@ -504,6 +982,7 @@ function collectNodes(root: LayoutNode): LayoutNode[] {
 }
 
 type RenderTreeContext = {
+  templateId: string;
   frameX: number;
   frameY: number;
   frameW: number;
@@ -511,29 +990,225 @@ type RenderTreeContext = {
   fields: Record<string, string>;
   fieldsUsed: Set<string>;
   treeById: Map<string, LayoutNode>;
-  containerTextMap: Map<string, LayoutNode>;
+  containerTextMap: Map<string, LayoutNode[]>;
   handledTextNodeIds: Set<string>;
   editableDebug: EditableTextDebug[];
   textContainerDebug: UniversalRenderDebug["textContainers"];
   assetsCache: Map<string, Buffer>;
   assetsMap: Record<string, string>;
+  badBoxes: Array<{ label: string; box: SafeBox | null }>;
+  skippedPhoto: boolean;
+  skippedPhotoReason: string[];
+  photoLayers: NonNullable<UniversalRenderDebug["photoLayers"]>;
+  computedBoxes: Map<string, LayoutBox>;
 };
 
-async function renderNodeTree(node: LayoutNode, context: RenderTreeContext): Promise<Layer[]> {
+function computeIntrinsicSize(
+  node: LayoutNode,
+  cache: Map<string, { width: number; height: number }>
+): { width: number; height: number } {
+  const cached = cache.get(node.id);
+  if (cached) return cached;
+
+  const fallback = {
+    width: Math.max(1, node.bbox?.width ?? 1),
+    height: Math.max(1, node.bbox?.height ?? 1)
+  };
+
+  if (!node.layoutMode || node.layoutMode === "NONE" || node.children.length === 0) {
+    cache.set(node.id, fallback);
+    return fallback;
+  }
+
+  const paddingLeft = node.paddingLeft ?? 0;
+  const paddingRight = node.paddingRight ?? 0;
+  const paddingTop = node.paddingTop ?? 0;
+  const paddingBottom = node.paddingBottom ?? 0;
+  const spacing = Number.isFinite(node.itemSpacing) ? (node.itemSpacing as number) : 50;
+  const childSizes = node.children.map((child) => computeIntrinsicSize(child, cache));
+
+  let contentW = 0;
+  let contentH = 0;
+  if (node.layoutMode === "HORIZONTAL") {
+    contentW = childSizes.reduce((sum, size) => sum + size.width, 0) + Math.max(0, childSizes.length - 1) * spacing;
+    contentH = childSizes.reduce((max, size) => Math.max(max, size.height), 0);
+  } else {
+    contentW = childSizes.reduce((max, size) => Math.max(max, size.width), 0);
+    contentH = childSizes.reduce((sum, size) => sum + size.height, 0) + Math.max(0, childSizes.length - 1) * spacing;
+  }
+
+  const intrinsic = {
+    width: Math.max(1, paddingLeft + contentW + paddingRight),
+    height: Math.max(1, paddingTop + contentH + paddingBottom)
+  };
+  const result = isFixedContainer(node) ? fallback : intrinsic;
+  cache.set(node.id, result);
+  return result;
+}
+
+function getRawRelativeBox(node: LayoutNode, frameX: number, frameY: number): LayoutBox | null {
+  const rel = toRelativeBbox(node, frameX, frameY);
+  if (!rel) return null;
+  return { x: rel.x, y: rel.y, width: Math.max(1, rel.width), height: Math.max(1, rel.height) };
+}
+
+function getSizingMode(node: LayoutNode, axis: "horizontal" | "vertical"): "FIXED" | "HUG" | "FILL" {
+  if (axis === "horizontal") {
+    if (node.layoutSizingHorizontal === "FILL") return "FILL";
+    if (node.layoutSizingHorizontal === "HUG") return "HUG";
+    if (node.layoutSizingHorizontal === "FIXED") return "FIXED";
+    if (node.counterAxisSizingMode === "FIXED") return "FIXED";
+    if (node.constraints?.horizontal === "LEFT_RIGHT") return "FILL";
+    return "HUG";
+  }
+  if (node.layoutSizingVertical === "FILL") return "FILL";
+  if (node.layoutSizingVertical === "HUG") return "HUG";
+  if (node.layoutSizingVertical === "FIXED") return "FIXED";
+  if (node.primaryAxisSizingMode === "FIXED") return "FIXED";
+  if (node.constraints?.vertical === "TOP_BOTTOM") return "FILL";
+  return "HUG";
+}
+
+function buildComputedLayoutBoxes(root: LayoutNode, frameX: number, frameY: number): Map<string, LayoutBox> {
+  const boxes = new Map<string, LayoutBox>();
+  const intrinsicCache = new Map<string, { width: number; height: number }>();
+
+  function assign(node: LayoutNode, forcedBox?: LayoutBox) {
+    const rawBox = getRawRelativeBox(node, frameX, frameY);
+    const nodeBox = forcedBox ?? rawBox;
+    if (!nodeBox) return;
+    boxes.set(node.id, nodeBox);
+
+    if (!node.layoutMode || node.layoutMode === "NONE" || node.children.length === 0) {
+      for (const child of node.children) {
+        assign(child);
+      }
+      return;
+    }
+
+    const padL = node.paddingLeft ?? 0;
+    const padR = node.paddingRight ?? 0;
+    const padT = node.paddingTop ?? 0;
+    const padB = node.paddingBottom ?? 0;
+    const gap = Number.isFinite(node.itemSpacing) ? (node.itemSpacing as number) : 50;
+    const innerX = nodeBox.x + padL;
+    const innerY = nodeBox.y + padT;
+    const innerW = Math.max(1, nodeBox.width - padL - padR);
+    const innerH = Math.max(1, nodeBox.height - padT - padB);
+    const mainAxis: "horizontal" | "vertical" = node.layoutMode === "HORIZONTAL" ? "horizontal" : "vertical";
+    const crossAxis: "horizontal" | "vertical" = mainAxis === "horizontal" ? "vertical" : "horizontal";
+
+    const childSpecs = node.children
+      .filter((child) => child.visible !== false)
+      .map((child) => {
+        const raw = getRawRelativeBox(child, frameX, frameY);
+        const intrinsic = computeIntrinsicSize(child, intrinsicCache);
+        const rawW = raw?.width ?? intrinsic.width;
+        const rawH = raw?.height ?? intrinsic.height;
+        return { child, rawW, rawH, intrinsic };
+      });
+
+    let fixedMainTotal = 0;
+    let fillCount = 0;
+    for (const spec of childSpecs) {
+      const mainMode = getSizingMode(spec.child, mainAxis);
+      if (mainMode === "FILL") {
+        fillCount += 1;
+        continue;
+      }
+      const mainSize =
+        mainAxis === "horizontal"
+          ? mainMode === "HUG"
+            ? spec.intrinsic.width
+            : spec.rawW
+          : mainMode === "HUG"
+            ? spec.intrinsic.height
+            : spec.rawH;
+      fixedMainTotal += Math.max(1, mainSize);
+    }
+    const totalSpacing = Math.max(0, childSpecs.length - 1) * gap;
+    const innerMain = mainAxis === "horizontal" ? innerW : innerH;
+    const leftoverMain = Math.max(0, innerMain - fixedMainTotal - totalSpacing);
+    const fillMainSize = fillCount > 0 ? Math.max(1, Math.floor(leftoverMain / fillCount)) : 0;
+
+    let cursor = 0;
+    for (const spec of childSpecs) {
+      const mainMode = getSizingMode(spec.child, mainAxis);
+      const crossMode = getSizingMode(spec.child, crossAxis);
+      const childMain =
+        mainMode === "FILL"
+          ? fillMainSize
+          : mainAxis === "horizontal"
+            ? mainMode === "HUG"
+              ? spec.intrinsic.width
+              : spec.rawW
+            : mainMode === "HUG"
+              ? spec.intrinsic.height
+              : spec.rawH;
+      const innerCross = crossAxis === "horizontal" ? innerW : innerH;
+      const childCross =
+        crossMode === "FILL"
+          ? innerCross
+          : crossAxis === "horizontal"
+            ? crossMode === "HUG"
+              ? spec.intrinsic.width
+              : spec.rawW
+            : crossMode === "HUG"
+              ? spec.intrinsic.height
+              : spec.rawH;
+
+      const box: LayoutBox =
+        mainAxis === "horizontal"
+          ? {
+              x: innerX + cursor,
+              y: innerY,
+              width: Math.max(1, childMain),
+              height: Math.max(1, childCross)
+            }
+          : {
+              x: innerX,
+              y: innerY + cursor,
+              width: Math.max(1, childCross),
+              height: Math.max(1, childMain)
+            };
+
+      assign(spec.child, box);
+      cursor += Math.max(1, childMain) + gap;
+    }
+  }
+
+  assign(root);
+  return boxes;
+}
+
+async function renderNodeTree(
+  node: LayoutNode,
+  context: RenderTreeContext
+): Promise<Layer[]> {
   if (!node.visible) return [];
 
   const layers: Layer[] = [];
   const editableKind = getEditableKind(node.name);
+  const nodeComputedRel = context.computedBoxes.get(node.id) ?? getRawRelativeBox(node, context.frameX, context.frameY);
 
   if (editableKind === "image") {
-    const photoLayer = await renderEditablePhoto(
+    const photoRendered = await renderEditablePhoto(
       node,
       context.fields,
       context.frameX,
       context.frameY,
-      context.fieldsUsed
+      context.frameW,
+      context.frameH,
+      context.fieldsUsed,
+      context.badBoxes,
+      (reason) => {
+        context.skippedPhoto = true;
+        context.skippedPhotoReason.push(reason);
+      },
+      nodeComputedRel ?? undefined
     );
-    if (photoLayer) layers.push(photoLayer);
+    if (photoRendered.layer) layers.push(photoRendered.layer);
+    if (photoRendered.photoDebug) context.photoLayers.push(photoRendered.photoDebug);
     return layers;
   }
 
@@ -542,26 +1217,7 @@ async function renderNodeTree(node: LayoutNode, context: RenderTreeContext): Pro
       return layers;
     }
     const rendered = await renderEditableText(
-      node,
-      context.treeById,
-      context.fields,
-      context.frameX,
-      context.frameY,
-      context.frameW,
-      context.frameH,
-      context.fieldsUsed
-    );
-    if (rendered.layer) layers.push(rendered.layer);
-    if (rendered.debug) context.editableDebug.push(rendered.debug);
-    return layers;
-  }
-
-  const mappedTextNode = context.containerTextMap.get(node.id);
-  const renderSelfAsDynamicContainer = Boolean(mappedTextNode);
-
-  if (renderSelfAsDynamicContainer && mappedTextNode) {
-    const rendered = await renderEditableText(
-      mappedTextNode,
+      [node],
       context.treeById,
       context.fields,
       context.frameX,
@@ -569,27 +1225,125 @@ async function renderNodeTree(node: LayoutNode, context: RenderTreeContext): Pro
       context.frameW,
       context.frameH,
       context.fieldsUsed,
-      node
+      context.badBoxes,
+      undefined,
+      nodeComputedRel ?? undefined,
+      context.computedBoxes
     );
     if (rendered.layer) layers.push(rendered.layer);
     if (rendered.debug) context.editableDebug.push(rendered.debug);
+    return layers;
+  }
+
+  const mappedTextNodes = context.containerTextMap.get(node.id);
+  const renderSelfAsDynamicContainer = Boolean(mappedTextNodes && mappedTextNodes.length > 0);
+  let dynamicRendered: { layer: Layer | null; debug?: EditableTextDebug } | null = null;
+
+  if (renderSelfAsDynamicContainer && mappedTextNodes) {
+    dynamicRendered = await renderEditableText(
+      mappedTextNodes,
+      context.treeById,
+      context.fields,
+      context.frameX,
+      context.frameY,
+      context.frameW,
+      context.frameH,
+      context.fieldsUsed,
+      context.badBoxes,
+      node,
+      nodeComputedRel ?? undefined,
+      context.computedBoxes
+    );
+    if (dynamicRendered.layer) layers.push(dynamicRendered.layer);
+    if (dynamicRendered.debug) context.editableDebug.push(dynamicRendered.debug);
+  } else if (node.bbox && getManualAssetType(node.name) && !context.assetsMap[node.id]) {
+    const manualType = getManualAssetType(node.name);
+    const relRaw = nodeComputedRel;
+    const rel = sanitizeBox(
+      relRaw ? { left: relRaw.x, top: relRaw.y, width: relRaw.width, height: relRaw.height } : null,
+      context.frameW,
+      context.frameH,
+      `manual-asset:${node.name}:${node.id}`,
+      context.badBoxes
+    );
+    if (rel && manualType) {
+      const width = rel.width;
+      const height = rel.height;
+      const safeFrameId = toSafeFrameId(context.templateId);
+      const genericKey = `assets/manual-assets/${safeFrameId}.png`;
+      const candidates =
+        manualType === "sticker"
+          ? [`assets/manual-assets/${safeFrameId}__sticker.png`, genericKey]
+          : [`assets/manual-assets/${safeFrameId}__marks.png`, genericKey];
+      let manualBuffer: Buffer | null = null;
+      for (const candidateKey of candidates) {
+        try {
+          manualBuffer = await getSnapshotAssetBuffer(candidateKey, context.assetsCache);
+          if (manualBuffer) break;
+        } catch (error) {
+          if (isObjectNotFoundError(error)) {
+            continue;
+          }
+          throw error;
+        }
+      }
+      if (manualBuffer) {
+        let buffer = await sharp(manualBuffer).resize(width, height, { fit: "fill" }).png().toBuffer();
+        buffer = await applyOpacityToPng(buffer, node.opacity);
+        layers.push({
+          nodeId: node.id,
+          left: rel.left,
+          top: rel.top,
+          width,
+          height,
+          input: buffer
+        });
+      }
+    }
+    return layers;
   } else if ((node.type === "FRAME" || node.type === "RECTANGLE") && hasSolidFill(node)) {
-    const rectLayer = await createSolidRectLayer(node, context.frameX, context.frameY);
+    const rectLayer = await createSolidRectLayer(
+      node,
+      context.frameX,
+      context.frameY,
+      context.frameW,
+      context.frameH,
+      context.badBoxes,
+      0,
+      0,
+      nodeComputedRel ?? undefined
+    );
     if (rectLayer) layers.push(rectLayer);
   } else if ((context.assetsMap[node.id] || node.assetKey) && node.bbox) {
-    const rel = toRelativeBbox(node, context.frameX, context.frameY);
+    const rel = sanitizeBox(
+      nodeComputedRel
+        ? { left: nodeComputedRel.x, top: nodeComputedRel.y, width: nodeComputedRel.width, height: nodeComputedRel.height }
+        : null,
+      context.frameW,
+      context.frameH,
+      `asset:${node.name}:${node.id}`,
+      context.badBoxes
+    );
     if (rel) {
-      const width = ensureLayerGeometry(rel.width, 1);
-      const height = ensureLayerGeometry(rel.height, 1);
+      const width = rel.width;
+      const height = rel.height;
       const assetKey = context.assetsMap[node.id] || node.assetKey;
       if (!assetKey) return layers;
-      let buffer = await getSnapshotAssetBuffer(assetKey, context.assetsCache);
+      let buffer: Buffer;
+      try {
+        buffer = await getSnapshotAssetBuffer(assetKey, context.assetsCache);
+      } catch (error) {
+        if (isObjectNotFoundError(error)) {
+          return layers;
+        }
+        throw error;
+      }
       buffer = await sharp(buffer).resize(width, height, { fit: "fill" }).png().toBuffer();
       buffer = await applyOpacityToPng(buffer, node.opacity);
       layers.push({
         nodeId: node.id,
-        left: toInt(rel.x),
-        top: toInt(rel.y),
+        left: rel.left,
+        top: rel.top,
         width,
         height,
         input: buffer
@@ -597,16 +1351,36 @@ async function renderNodeTree(node: LayoutNode, context: RenderTreeContext): Pro
     }
     return layers;
   } else if (ATOMIC_IMAGE_TYPES.has(node.type) && hasSolidFill(node)) {
-    const fallbackLayer = await createSolidRectLayer(node, context.frameX, context.frameY);
+    const fallbackLayer = await createSolidRectLayer(
+      node,
+      context.frameX,
+      context.frameY,
+      context.frameW,
+      context.frameH,
+      context.badBoxes,
+      0,
+      0,
+      nodeComputedRel ?? undefined
+    );
     if (fallbackLayer) layers.push(fallbackLayer);
     return layers;
   } else if (node.children.length === 0 && node.bbox && hasSolidFill(node)) {
-    const fallbackLayer = await createSolidRectLayer(node, context.frameX, context.frameY);
+    const fallbackLayer = await createSolidRectLayer(
+      node,
+      context.frameX,
+      context.frameY,
+      context.frameW,
+      context.frameH,
+      context.badBoxes,
+      0,
+      0,
+      nodeComputedRel ?? undefined
+    );
     if (fallbackLayer) layers.push(fallbackLayer);
   }
 
   for (const child of node.children) {
-    if (mappedTextNode && child.id === mappedTextNode.id) {
+    if (mappedTextNodes?.some((textNode) => textNode.id === child.id)) {
       continue;
     }
     const childLayers = await renderNodeTree(child, context);
@@ -632,28 +1406,49 @@ export async function renderUniversalTemplate(input: {
 
   const frameX = ensureFinite("frameX", frame.bbox.x);
   const frameY = ensureFinite("frameY", frame.bbox.y);
-  const frameW = ensureLayerGeometry(frame.bbox.width, 1);
-  const frameH = ensureLayerGeometry(frame.bbox.height, 1);
+  const frameWidthRaw = frame.bbox.width;
+  const frameHeightRaw = frame.bbox.height;
+  const frameW =
+    Number.isFinite(frameWidthRaw) && frameWidthRaw > 0
+      ? ensureLayerGeometry(frameWidthRaw, 1)
+      : (console.warn(`[universalEngine] Missing frame width in snapshot for ${input.templateId}, fallback=2000`), 2000);
+  const frameH =
+    Number.isFinite(frameHeightRaw) && frameHeightRaw > 0
+      ? ensureLayerGeometry(frameHeightRaw, 1)
+      : (console.warn(`[universalEngine] Missing frame height in snapshot for ${input.templateId}, fallback=2000`), 2000);
   const allNodes = collectNodes(frame);
+  const nodeOrder = new Map<string, number>();
+  allNodes.forEach((node, index) => {
+    nodeOrder.set(node.id, index);
+  });
   const editableTextNodes = allNodes.filter((node) => node.visible && getEditableKind(node.name) === "text");
-  const containerTextMap = new Map<string, LayoutNode>();
+  const containerTextMap = new Map<string, LayoutNode[]>();
   const handledTextNodeIds = new Set<string>();
   for (const textNode of editableTextNodes) {
     const container = findNearestResizableContainer(textNode, tree.byId);
-    if (container && !containerTextMap.has(container.id)) {
-      containerTextMap.set(container.id, textNode);
+    if (container) {
+      const list = containerTextMap.get(container.id) ?? [];
+      list.push(textNode);
+      containerTextMap.set(container.id, list);
       handledTextNodeIds.add(textNode.id);
     }
+  }
+  for (const [containerId, list] of containerTextMap.entries()) {
+    list.sort((a, b) => (nodeOrder.get(a.id) ?? 0) - (nodeOrder.get(b.id) ?? 0));
+    containerTextMap.set(containerId, list);
   }
 
   const editableDebug: EditableTextDebug[] = [];
   const textContainerDebug: UniversalRenderDebug["textContainers"] = [];
   const fieldsUsed = new Set<string>();
+  const badBoxes: Array<{ label: string; box: SafeBox | null }> = [];
   const frameAssetsMap =
     input.frameNode && typeof input.frameNode === "object" && input.frameNode.assetsMap
       ? input.frameNode.assetsMap
       : {};
-  const allLayers = await renderNodeTree(frame, {
+  const computedBoxes = buildComputedLayoutBoxes(frame, frameX, frameY);
+  const renderContext: RenderTreeContext = {
+    templateId: input.templateId,
     frameX,
     frameY,
     frameW,
@@ -666,8 +1461,14 @@ export async function renderUniversalTemplate(input: {
     editableDebug,
     textContainerDebug,
     assetsCache: new Map<string, Buffer>(),
-    assetsMap: frameAssetsMap
-  });
+    assetsMap: frameAssetsMap,
+    badBoxes,
+    skippedPhoto: false,
+    skippedPhotoReason: [],
+    photoLayers: [],
+    computedBoxes
+  };
+  const allLayers = await renderNodeTree(frame, renderContext);
 
   for (const item of editableDebug) {
     textContainerDebug.push({
@@ -683,35 +1484,40 @@ export async function renderUniversalTemplate(input: {
     });
   }
 
-  let minX = 0;
-  let minY = 0;
-  let maxX = frameW;
-  let maxY = frameH;
+  const minX = 0;
+  const minY = 0;
+  const maxX = frameW;
+  const maxY = frameH;
+  const bigW = frameW;
+  const bigH = frameH;
+  const paddingLeft = 0;
+  const paddingTop = 0;
 
+  const composite: Array<{ input: Buffer; left: number; top: number; blend?: sharp.Blend }> = [];
   for (const layer of allLayers) {
-    const x1 = ensureFinite("layer.left", layer.left);
-    const y1 = ensureFinite("layer.top", layer.top);
-    const x2 = x1 + ensureFinite("layer.width", layer.width);
-    const y2 = y1 + ensureFinite("layer.height", layer.height);
-
-    minX = Math.min(minX, x1);
-    minY = Math.min(minY, y1);
-    maxX = Math.max(maxX, x2);
-    maxY = Math.max(maxY, y2);
+    const normalized = await normalizeCompositeItem(
+      frameW,
+      frameH,
+      {
+        input: layer.input,
+        left: layer.left,
+        top: layer.top,
+        width: layer.width,
+        height: layer.height
+      },
+      `composite:${layer.nodeId}`,
+      badBoxes
+    );
+    if (!normalized) continue;
+    composite.push({
+      input: normalized.input,
+      left: normalized.left,
+      top: normalized.top,
+      blend: normalized.blend
+    });
   }
 
-  const bigW = ensureLayerGeometry(maxX - minX, frameW);
-  const bigH = ensureLayerGeometry(maxY - minY, frameH);
-  const paddingLeft = minX < 0 ? Math.abs(minX) : 0;
-  const paddingTop = minY < 0 ? Math.abs(minY) : 0;
-
-  const composite = allLayers.map((layer) => ({
-    input: layer.input,
-    left: ensureLayerGeometry(layer.left + paddingLeft, 0),
-    top: ensureLayerGeometry(layer.top + paddingTop, 0)
-  }));
-
-  const bigCanvas = await sharp({
+  const frameCanvas = await sharp({
     create: {
       width: bigW,
       height: bigH,
@@ -722,16 +1528,17 @@ export async function renderUniversalTemplate(input: {
     .composite(composite)
     .png()
     .toBuffer();
-
-  const png = await sharp(bigCanvas)
-    .extract({
-      left: ensureLayerGeometry(paddingLeft, 0),
-      top: ensureLayerGeometry(paddingTop, 0),
-      width: frameW,
-      height: frameH
-    })
-    .png()
-    .toBuffer();
+  const extractBox = sanitizeBox(
+    { left: 0, top: 0, width: frameW, height: frameH },
+    frameW,
+    frameH,
+    "extract:frame",
+    badBoxes
+  );
+  if (!extractBox) {
+    throw new Error("Computed frame extract box invalid");
+  }
+  const png = await sharp(frameCanvas).png().toBuffer();
 
   if (!input.includeDebug) {
     return { png };
@@ -756,7 +1563,11 @@ export async function renderUniversalTemplate(input: {
         paddingTop
       },
       editables: editableDebug,
-      textContainers: textContainerDebug
+      textContainers: textContainerDebug,
+      badBoxes: badBoxes.length > 0 ? badBoxes : undefined,
+      skippedPhoto: renderContext.skippedPhoto ? true : undefined,
+      skippedPhotoReason: renderContext.skippedPhotoReason.length > 0 ? renderContext.skippedPhotoReason : undefined,
+      photoLayers: renderContext.photoLayers.length > 0 ? renderContext.photoLayers : undefined
     }
   };
 }

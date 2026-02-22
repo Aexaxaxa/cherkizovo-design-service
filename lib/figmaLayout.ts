@@ -47,13 +47,16 @@ export type FigmaNodeLite = {
   assetsMap?: Record<string, string>;
   characters?: string;
   style?: {
+    fontFamily?: string;
     fontPostScriptName?: string;
     fontSize?: number;
     fontWeight?: number;
     letterSpacing?: number;
     lineHeightPx?: number;
+    lineHeightPercent?: number;
     lineHeightUnit?: string;
     lineHeightPercentFontSize?: number;
+    textAlignHorizontal?: "LEFT" | "CENTER" | "RIGHT" | string;
   };
   children?: FigmaNodeLite[];
 };
@@ -95,13 +98,16 @@ export type LayoutNode = {
   counterAxisSizingMode?: string;
   characters?: string;
   textStyle?: {
+    fontFamily?: string;
     fontPostScriptName?: string;
     fontSize?: number;
     fontWeight?: number;
     letterSpacing?: number;
     lineHeightPx?: number;
+    lineHeightPercent?: number;
     lineHeightUnit?: string;
     lineHeightPercentFontSize?: number;
+    textAlignHorizontal?: string;
   };
   children: LayoutNode[];
 };
@@ -204,13 +210,16 @@ function toLayoutNode(input: FigmaNodeLite, parentId: string | undefined, byId: 
     characters: input.characters,
     textStyle: input.style
       ? {
+          fontFamily: input.style.fontFamily,
           fontPostScriptName: input.style.fontPostScriptName,
           fontSize: input.style.fontSize,
           fontWeight: input.style.fontWeight,
           letterSpacing: input.style.letterSpacing,
           lineHeightPx: input.style.lineHeightPx,
+          lineHeightPercent: input.style.lineHeightPercent,
           lineHeightUnit: input.style.lineHeightUnit,
-          lineHeightPercentFontSize: input.style.lineHeightPercentFontSize
+          lineHeightPercentFontSize: input.style.lineHeightPercentFontSize,
+          textAlignHorizontal: input.style.textAlignHorizontal
         }
       : undefined,
     children: []

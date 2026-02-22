@@ -3,11 +3,11 @@ import { getEnv } from "@/lib/env";
 import { FigmaApiError, figmaFetchBytes, figmaFetchJsonWithMeta } from "@/lib/figmaClient";
 import { extractSchemaFields } from "@/lib/schemaExtractor";
 import {
-  getAssetSnapshotKey,
   getFrameSnapshotKey,
   getMetaSnapshotKey,
   getSchemaSnapshotKey,
   getTemplatesSnapshotKey,
+  toSafeNodeId,
   type SnapshotTemplate,
   writeSnapshotJson
 } from "@/lib/snapshotStore";
@@ -102,21 +102,26 @@ function extractTemplates(file: FigmaFileResponse): SnapshotTemplate[] {
   return templates;
 }
 
-function shouldExportLogoAsset(node: FigmaNode): boolean {
-  if (node.visible === false) return false;
+const EXPORT_ASSET_NAMES = new Set(["logo", "logo_bg", "sticker", "marks"]);
+type AssetKind = "logo" | "logo_bg" | "sticker" | "marks";
+
+function getAssetKind(node: FigmaNode): AssetKind | null {
+  if (node.visible === false) return null;
   const lowerName = normalizeName(node.name).toLowerCase();
-  return lowerName === "logo" || lowerName === "logo_bg";
+  if (!EXPORT_ASSET_NAMES.has(lowerName)) return null;
+  return lowerName as AssetKind;
 }
 
-function collectLogoNodeIds(root: FigmaNode, out: Set<string>): void {
+function collectAssetNodes(root: FigmaNode, out: Map<string, AssetKind>): void {
   if (root.visible === false) return;
 
-  if (root.id && shouldExportLogoAsset(root)) {
-    out.add(root.id);
+  const kind = getAssetKind(root);
+  if (root.id && kind) {
+    out.set(root.id, kind);
   }
 
   for (const child of root.children ?? []) {
-    collectLogoNodeIds(child, out);
+    collectAssetNodes(child, out);
   }
 }
 
@@ -277,18 +282,18 @@ async function fetchNodesWithFallback(
   throw new Error("Failed to fetch nodes with fallback batch sizes");
 }
 
-async function exportLogoAssetsForFrames(
+async function exportNamedAssetsForFrames(
   fileKey: string,
   frameDocs: Map<string, FigmaNode>,
   sharedAssetsMap: Map<string, string>,
   progress: SyncProgress,
   onBatchRequest: () => void
 ): Promise<void> {
-  const logoNodeIds = new Set<string>();
+  const assetsByNode = new Map<string, AssetKind>();
   for (const frameDoc of frameDocs.values()) {
-    collectLogoNodeIds(frameDoc, logoNodeIds);
+    collectAssetNodes(frameDoc, assetsByNode);
   }
-  const missingNodeIds = [...logoNodeIds].filter((nodeId) => !sharedAssetsMap.has(nodeId));
+  const missingNodeIds = [...assetsByNode.keys()].filter((nodeId) => !sharedAssetsMap.has(nodeId));
   if (missingNodeIds.length === 0) return;
 
   for (const idsChunk of chunk(missingNodeIds, TARGET_BATCH_SIZE)) {
@@ -306,12 +311,15 @@ async function exportLogoAssetsForFrames(
     for (const nodeId of idsChunk) {
       const imageUrl = data.images?.[nodeId];
       if (!imageUrl) continue;
+      const kind = assetsByNode.get(nodeId);
+      if (!kind) continue;
       const bytes = await figmaFetchBytes(imageUrl, {
         maxRetries: 1,
         sleepOn429: false,
         timeoutMs: FIGMA_SYNC_TIMEOUT_MS
       });
-      const assetKey = getAssetSnapshotKey(fileKey, nodeId);
+      const safeNodeId = toSafeNodeId(nodeId);
+      const assetKey = `snapshots/${fileKey}/assets/${safeNodeId}__${kind}.png`;
       await putObject({
         Key: assetKey,
         Body: bytes,
@@ -447,7 +455,7 @@ export async function POST(request: Request) {
       }
 
       try {
-        await exportLogoAssetsForFrames(fileKey, docsResult.documents, exportedAssetsMap, progress, () => {
+        await exportNamedAssetsForFrames(fileKey, docsResult.documents, exportedAssetsMap, progress, () => {
           processedBatches += 1;
         });
       } catch (error) {

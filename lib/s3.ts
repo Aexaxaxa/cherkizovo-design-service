@@ -8,9 +8,29 @@ import {
   type PutObjectCommandInput
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { LruTtlCache } from "@/lib/cache";
 import { getEnv } from "@/lib/env";
+import { streamToBuffer } from "@/lib/streamToBuffer";
 
 let s3Client: S3Client | null = null;
+let jsonCache: LruTtlCache<unknown> | null = null;
+let bufferCache: LruTtlCache<Buffer> | null = null;
+
+function initCaches() {
+  if (jsonCache && bufferCache) return;
+  const env = getEnv();
+  jsonCache = new LruTtlCache<unknown>({
+    maxItems: env.CACHE_JSON_MAX_ITEMS,
+    debug: env.CACHE_DEBUG,
+    name: "json"
+  });
+  bufferCache = new LruTtlCache<Buffer>({
+    maxItems: env.CACHE_ASSET_MAX_ITEMS,
+    maxBytes: env.CACHE_ASSET_MAX_BYTES,
+    debug: env.CACHE_DEBUG,
+    name: "buffer"
+  });
+}
 
 export function getS3Client(): S3Client {
   if (s3Client) {
@@ -50,6 +70,57 @@ export async function getObject(key: string) {
       Bucket: env.B2_BUCKET_NAME,
       Key: key
     })
+  );
+}
+
+export async function getObjectBuffer(key: string): Promise<Buffer> {
+  const response = await getObject(key);
+  if (!response.Body) {
+    throw new Error(`Object body is empty: ${key}`);
+  }
+  return streamToBuffer(response.Body);
+}
+
+function getJsonCacheKey(s3Key: string): string {
+  return `json:${s3Key}`;
+}
+
+function getBufferCacheKey(s3Key: string): string {
+  return `buf:${s3Key}`;
+}
+
+export async function getJsonCached<T>(s3Key: string): Promise<T> {
+  const env = getEnv();
+  if (!env.CACHE_ENABLED) {
+    return JSON.parse((await getObjectBuffer(s3Key)).toString("utf-8")) as T;
+  }
+
+  initCaches();
+  const ttlMs = env.CACHE_JSON_TTL_SEC * 1000;
+  const key = getJsonCacheKey(s3Key);
+  return (await jsonCache!.getOrSetAsync(key, ttlMs, async () => {
+    const buffer = await getObjectBuffer(s3Key);
+    return JSON.parse(buffer.toString("utf-8")) as T;
+  })) as T;
+}
+
+export async function getBufferCached(s3Key: string): Promise<Buffer> {
+  const env = getEnv();
+  if (!env.CACHE_ENABLED) {
+    return getObjectBuffer(s3Key);
+  }
+
+  initCaches();
+  const ttlMs = env.CACHE_ASSET_TTL_SEC * 1000;
+  const key = getBufferCacheKey(s3Key);
+  return bufferCache!.getOrSetAsync(
+    key,
+    ttlMs,
+    async () => {
+      const buffer = await getObjectBuffer(s3Key);
+      return buffer;
+    },
+    undefined
   );
 }
 
@@ -112,4 +183,18 @@ export async function listObjectKeysByPrefix(prefix: string): Promise<string[]> 
   } while (continuationToken);
 
   return out;
+}
+
+export function clearRuntimeCaches() {
+  if (jsonCache) jsonCache.clear();
+  if (bufferCache) bufferCache.clear();
+}
+
+export function getRuntimeCacheStats() {
+  initCaches();
+  return {
+    json: jsonCache!.stats(),
+    buffer: bufferCache!.stats(),
+    inMemoryEnabled: getEnv().CACHE_ENABLED
+  };
 }

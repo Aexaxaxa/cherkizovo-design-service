@@ -21,7 +21,7 @@ import {
   type SnapshotTemplate,
   writeSnapshotJson
 } from "@/lib/snapshotStore";
-import { putObject } from "@/lib/s3";
+import { clearRuntimeCaches, putObject } from "@/lib/s3";
 
 export const runtime = "nodejs";
 
@@ -414,6 +414,8 @@ export async function POST(request: Request) {
         removedTemplates: templatesDiff.removedTemplates
       });
     }
+
+    clearRuntimeCaches();
 
     return NextResponse.json({
       status: "ok",

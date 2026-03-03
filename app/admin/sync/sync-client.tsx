@@ -22,6 +22,12 @@ type AdminMeta = {
 };
 
 type SyncPayload = Record<string, unknown>;
+type SyncMode = "full" | "dry" | "single";
+
+function readString(payload: SyncPayload | null, key: string): string {
+  const value = payload?.[key];
+  return typeof value === "string" ? value : "n/a";
+}
 
 export default function AdminSyncClient({ token }: { token: string }) {
   const [templateId, setTemplateId] = useState("");
@@ -29,8 +35,10 @@ export default function AdminSyncClient({ token }: { token: string }) {
   const [meta, setMeta] = useState<AdminMeta | null>(null);
   const [result, setResult] = useState<SyncPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isPageVisible, setIsPageVisible] = useState(true);
 
   const statusUrl = useMemo(() => `/api/admin/status?token=${encodeURIComponent(token)}`, [token]);
+  const isRunning = loading || meta?.status === "running";
 
   const loadStatus = useCallback(async () => {
     const response = await fetch(statusUrl, { cache: "no-store" });
@@ -49,26 +57,60 @@ export default function AdminSyncClient({ token }: { token: string }) {
   }, [statusUrl]);
 
   useEffect(() => {
-    void loadStatus().catch((err) => setError(err instanceof Error ? err.message : "Failed to load status"));
+    setIsPageVisible(typeof document === "undefined" ? true : !document.hidden);
+    void loadStatus().catch((err) => {
+      console.error("[admin/sync] status init failed", err);
+      setError("Failed to load current sync status");
+    });
   }, [loadStatus]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      void loadStatus().catch(() => undefined);
-    }, 3000);
-    return () => window.clearInterval(timer);
+    const onVisibilityChange = () => {
+      const visible = !document.hidden;
+      setIsPageVisible(visible);
+      if (visible) {
+        void loadStatus().catch((err) => {
+          console.error("[admin/sync] status reload after tab focus failed", err);
+        });
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
   }, [loadStatus]);
 
-  async function runSync(dryRun: boolean) {
+  useEffect(() => {
+    if (!isPageVisible) return;
+
+    const intervalMs = meta?.status === "running" ? 3000 : 60000;
+    const timer = window.setTimeout(() => {
+      void loadStatus().catch((err) => {
+        console.error("[admin/sync] polling failed", err);
+      });
+    }, intervalMs);
+
+    return () => window.clearTimeout(timer);
+  }, [isPageVisible, loadStatus, meta?.status]);
+
+  async function runSync(mode: SyncMode) {
+    if (mode === "single" && !templateId.trim()) {
+      setError("Enter templateId for single template sync");
+      return;
+    }
+
     setLoading(true);
     setError(null);
     setResult(null);
+
     try {
       const params = new URLSearchParams();
       params.set("token", token);
-      if (dryRun) params.set("dry", "1");
-      const trimmedTemplateId = templateId.trim();
-      if (trimmedTemplateId) params.set("templateId", trimmedTemplateId);
+      if (mode === "dry") {
+        params.set("dry", "1");
+      }
+      if (mode === "single") {
+        params.set("templateId", templateId.trim());
+      }
+
       const response = await fetch(`/api/admin/sync?${params.toString()}`, {
         method: "POST"
       });
@@ -83,7 +125,8 @@ export default function AdminSyncClient({ token }: { token: string }) {
       setResult((payload ?? {}) as SyncPayload);
       await loadStatus();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Sync failed");
+      console.error("[admin/sync] sync run failed", err);
+      setError("Failed to start sync");
       await loadStatus().catch(() => undefined);
     } finally {
       setLoading(false);
@@ -106,28 +149,48 @@ export default function AdminSyncClient({ token }: { token: string }) {
         />
 
         <div className="row" style={{ marginTop: 12 }}>
-          <button type="button" disabled={loading} onClick={() => void runSync(false)}>
-            {loading ? "Running..." : "Run Sync"}
+          <button type="button" disabled={isRunning} onClick={() => void runSync("full")}>
+            {isRunning ? "Running..." : "Run full sync"}
           </button>
-          <button type="button" disabled={loading} onClick={() => void runSync(true)}>
-            {loading ? "Running..." : "Dry Run"}
+          <button type="button" disabled={isRunning} onClick={() => void runSync("dry")}>
+            {isRunning ? "Running..." : "Dry run"}
           </button>
-          <button type="button" disabled={loading} onClick={() => void loadStatus()}>
+          <button type="button" disabled={isRunning} onClick={() => void runSync("single")}>
+            {isRunning ? "Running..." : "Run single template sync"}
+          </button>
+          <button
+            type="button"
+            disabled={loading}
+            onClick={() =>
+              void loadStatus().catch((err) => {
+                console.error("[admin/sync] manual refresh failed", err);
+                setError("Failed to refresh status");
+              })
+            }
+          >
             Refresh Status
           </button>
         </div>
 
         {error ? <p className="muted" style={{ color: "#a30000", marginTop: 12 }}>{error}</p> : null}
 
-        <h2 style={{ marginTop: 20 }}>Meta</h2>
-        <pre style={{ background: "#f5f5f5", padding: 12, borderRadius: 8, overflow: "auto" }}>
-          {JSON.stringify(meta, null, 2)}
-        </pre>
+        <h2 style={{ marginTop: 20 }}>Current status</h2>
+        <p className="muted">
+          State: <strong>{meta?.status ?? "unknown"}</strong>
+        </p>
+        <p className="muted">Started: {meta?.startedAt ?? "n/a"}</p>
+        <p className="muted">Finished: {meta?.finishedAt ?? "n/a"}</p>
+        <p className="muted">Synced: {meta?.syncedAt ?? "n/a"}</p>
+        <p className="muted">
+          Counters: templates {meta?.templatesFound ?? 0}, frames {meta?.framesSaved ?? 0}, schemas{" "}
+          {meta?.schemasSaved ?? 0}, assets {meta?.assetsSaved ?? 0}
+        </p>
+        <p className="muted">Batch: {meta ? `${meta.currentBatchIndex}/${meta.totalBatches}` : "0/0"}</p>
 
         <h2 style={{ marginTop: 20 }}>Last Response</h2>
-        <pre style={{ background: "#f5f5f5", padding: 12, borderRadius: 8, overflow: "auto" }}>
-          {JSON.stringify(result, null, 2)}
-        </pre>
+        <p className="muted">Status: {readString(result, "status")}</p>
+        <p className="muted">Started: {readString(result, "startedAt")}</p>
+        <p className="muted">Finished: {readString(result, "finishedAt")}</p>
       </div>
     </main>
   );

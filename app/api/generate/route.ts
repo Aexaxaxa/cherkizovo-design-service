@@ -6,11 +6,12 @@ import sharp from "sharp";
 import { getEnv, isUniversalEngineEnabled } from "@/lib/env";
 import { getFigmaNodePng } from "@/lib/figmaImages";
 import { applyRoundedRectMask } from "@/lib/masks";
+import { resolvePhotobankDownloadHref } from "@/lib/photobank";
 import { getObject, getSignedGetUrl, putObject } from "@/lib/s3";
-import { getFrameSnapshotKey, tryReadSnapshotJson } from "@/lib/snapshotStore";
+import { getFrameSnapshotKey, getSchemaSnapshotKey, readSnapshotJson, tryReadSnapshotJson } from "@/lib/snapshotStore";
 import { streamToBuffer } from "@/lib/streamToBuffer";
 import { getTemplateById, TPL_VK_POST_1_FIGMA, TPL_VK_POST_1_ID } from "@/lib/templates";
-import { renderUniversalTemplate } from "@/lib/universalEngine";
+import { renderUniversalTemplate, validateTextLineLimits, type TextSizeAdjustMap } from "@/lib/universalEngine";
 import {
   buildSvgPathsForLines,
   getFontMetricsPx,
@@ -26,7 +27,211 @@ type GeneratePayload = {
   title?: string;
   objectKey?: string;
   fields?: Record<string, string>;
+  textSizeAdjust?: Record<string, unknown>;
 };
+
+type SchemaField = {
+  key: string;
+  type: "text" | "image";
+  label: string;
+};
+
+type SchemaPayload = {
+  templateId: string;
+  templateName: string;
+  fields: SchemaField[];
+};
+
+type PhotobankRef = {
+  source: "photobank";
+  path: string;
+  name?: string;
+  previewUrl?: string;
+};
+
+type MultipartGenerateInput = {
+  templateId: string;
+  textFields: Record<string, string>;
+  textSizeAdjust: TextSizeAdjustMap;
+  photoRefs: Record<string, PhotobankRef>;
+  files: Record<string, File>;
+};
+
+const SUPPORTED_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
+const MAX_FILE_BYTES = 15 * 1024 * 1024;
+
+function parseTextSizeAdjust(raw: Record<string, unknown> | undefined): TextSizeAdjustMap {
+  const out: TextSizeAdjustMap = {};
+  if (!raw) return out;
+
+  for (const [field, value] of Object.entries(raw)) {
+    if (value === -1 || value === 0 || value === 1) {
+      out[field] = value;
+      continue;
+    }
+    if (typeof value === "string") {
+      const numeric = Number(value);
+      if (numeric === -1 || numeric === 0 || numeric === 1) {
+        out[field] = numeric;
+      }
+    }
+  }
+
+  return out;
+}
+
+function extFromMime(mimeType: string): string {
+  switch (mimeType) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/png":
+      return "png";
+    case "image/webp":
+      return "webp";
+    default:
+      return "bin";
+  }
+}
+
+function normalizeMimeType(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const typeOnly = raw.split(";")[0]?.trim().toLowerCase();
+  if (!typeOnly) return null;
+  return SUPPORTED_MIME.has(typeOnly) ? typeOnly : null;
+}
+
+function inferMimeByPath(path: string): string | null {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".webp")) return "image/webp";
+  return null;
+}
+
+async function uploadBufferToB2(buffer: Buffer, mimeType: string): Promise<string> {
+  const objectKey = `uploads/${randomUUID()}.${extFromMime(mimeType)}`;
+  await putObject({
+    Key: objectKey,
+    Body: buffer,
+    ContentType: mimeType
+  });
+  return objectKey;
+}
+
+function jsonError(code: string, error: string, status: number): NextResponse {
+  return NextResponse.json({ code, error }, { status });
+}
+
+async function parseMultipartGenerateInput(request: Request): Promise<MultipartGenerateInput> {
+  const formData = await request.formData();
+  const templateId = String(formData.get("templateId") ?? "").trim();
+  if (!templateId) {
+    throw new Error("templateId is required");
+  }
+
+  let textFields: Record<string, string> = {};
+  const rawFields = formData.get("fields");
+  if (typeof rawFields === "string" && rawFields.trim()) {
+    const parsed = JSON.parse(rawFields) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      textFields = Object.fromEntries(
+        Object.entries(parsed).filter(([, value]) => typeof value === "string")
+      ) as Record<string, string>;
+    }
+  }
+
+  let textSizeAdjust: TextSizeAdjustMap = {};
+  const rawAdjust = formData.get("textSizeAdjust");
+  if (typeof rawAdjust === "string" && rawAdjust.trim()) {
+    const parsed = JSON.parse(rawAdjust) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      textSizeAdjust = parseTextSizeAdjust(parsed as Record<string, unknown>);
+    }
+  }
+
+  let photoRefs: Record<string, PhotobankRef> = {};
+  const rawPhotoRefs = formData.get("photoRefs");
+  if (typeof rawPhotoRefs === "string" && rawPhotoRefs.trim()) {
+    const parsed = JSON.parse(rawPhotoRefs) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      photoRefs = {};
+      for (const [field, value] of Object.entries(parsed)) {
+        if (!value || typeof value !== "object") continue;
+        const source = "source" in value ? value.source : undefined;
+        const path = "path" in value ? value.path : undefined;
+        if (source === "photobank" && typeof path === "string" && path.trim()) {
+          photoRefs[field] = {
+            source: "photobank",
+            path: path.trim(),
+            name: "name" in value && typeof value.name === "string" ? value.name : undefined,
+            previewUrl: "previewUrl" in value && typeof value.previewUrl === "string" ? value.previewUrl : undefined
+          };
+        }
+      }
+    }
+  }
+
+  const files: Record<string, File> = {};
+  for (const [key, value] of formData.entries()) {
+    if (value instanceof File) {
+      files[key] = value;
+    }
+  }
+
+  return {
+    templateId,
+    textFields,
+    textSizeAdjust,
+    photoRefs,
+    files
+  };
+}
+
+async function localFileToObjectKey(file: File): Promise<string> {
+  const mimeType = normalizeMimeType(file.type);
+  if (!mimeType) {
+    throw new Error("E_UPLOAD_TYPE");
+  }
+  if (file.size > MAX_FILE_BYTES) {
+    throw new Error("E_UPLOAD_TOO_LARGE");
+  }
+  const body = Buffer.from(await file.arrayBuffer());
+  return uploadBufferToB2(body, mimeType);
+}
+
+async function photobankRefToObjectKey(path: string): Promise<string> {
+  let response: Response;
+  try {
+    const href = await resolvePhotobankDownloadHref(path);
+    response = await fetch(href, { cache: "no-store" });
+  } catch {
+    throw new Error("E_PHOTOBANK_DOWNLOAD");
+  }
+  if (!response.ok) {
+    throw new Error("E_PHOTOBANK_DOWNLOAD");
+  }
+
+  const contentLengthRaw = response.headers.get("content-length");
+  if (contentLengthRaw) {
+    const contentLength = Number(contentLengthRaw);
+    if (Number.isFinite(contentLength) && contentLength > MAX_FILE_BYTES) {
+      throw new Error("E_UPLOAD_TOO_LARGE");
+    }
+  }
+
+  const mimeByHeader = normalizeMimeType(response.headers.get("content-type"));
+  const mimeType = mimeByHeader ?? inferMimeByPath(path);
+  if (!mimeType) {
+    throw new Error("E_UPLOAD_TYPE");
+  }
+
+  const body = Buffer.from(await response.arrayBuffer());
+  if (body.length > MAX_FILE_BYTES) {
+    throw new Error("E_UPLOAD_TOO_LARGE");
+  }
+
+  return uploadBufferToB2(body, mimeType);
+}
 
 type FigmaRenderDebug = {
   blockX: number;
@@ -401,16 +606,37 @@ export async function POST(request: Request) {
   let debugPayload: FigmaRenderDebug | undefined;
 
   try {
-    const payload = (await request.json()) as GeneratePayload;
-    const templateId = payload.templateId?.trim();
-    const requestFields: Record<string, string> = {};
-    if (payload.fields && typeof payload.fields === "object" && !Array.isArray(payload.fields)) {
+    const validateOnly = new URL(request.url).searchParams.get("validate") === "1";
+    const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
+    let payload: GeneratePayload | null = null;
+    let multipartInput: MultipartGenerateInput | null = null;
+
+    if (!validateOnly && contentType.includes("multipart/form-data")) {
+      multipartInput = await parseMultipartGenerateInput(request);
+    } else {
+      payload = (await request.json()) as GeneratePayload;
+    }
+
+    const templateId = multipartInput?.templateId ?? payload?.templateId?.trim();
+    const requestFields: Record<string, string> = multipartInput?.textFields
+      ? { ...multipartInput.textFields }
+      : {};
+
+    if (payload?.fields && typeof payload.fields === "object" && !Array.isArray(payload.fields)) {
       for (const [key, value] of Object.entries(payload.fields)) {
         if (typeof value === "string") {
           requestFields[key] = value;
         }
       }
     }
+
+    const textSizeAdjust = multipartInput?.textSizeAdjust
+      ? multipartInput.textSizeAdjust
+      : parseTextSizeAdjust(
+          payload?.textSizeAdjust && typeof payload.textSizeAdjust === "object" && !Array.isArray(payload.textSizeAdjust)
+            ? payload.textSizeAdjust
+            : undefined
+        );
 
     if (universalEnabled) {
       if (!templateId) {
@@ -428,9 +654,80 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: "No snapshot. Run POST /api/admin/sync" }, { status: 503 });
       }
 
+      const textTooLong = await validateTextLineLimits({
+        templateId,
+        fields: requestFields,
+        textSizeAdjust,
+        frameNode: frameNode as Parameters<typeof renderUniversalTemplate>[0]["frameNode"]
+      });
+      if (textTooLong) {
+        return NextResponse.json(
+          {
+            error: "Text too long",
+            code: textTooLong.code,
+            field: textTooLong.field,
+            maxLines: textTooLong.maxLines,
+            actualLines: textTooLong.actualLines
+          },
+          { status: 400 }
+        );
+      }
+
+      if (validateOnly) {
+        return NextResponse.json({ ok: true });
+      }
+
+      if (multipartInput) {
+        const schemaKey = getSchemaSnapshotKey(fileKey, templateId);
+        const schemaPayload = await readSnapshotJson<SchemaPayload>(schemaKey);
+        const imageFields = schemaPayload.fields.filter((field) => field.type === "image");
+
+        for (const field of imageFields) {
+          try {
+            const localFile = multipartInput.files[field.key];
+            const photobankRef = multipartInput.photoRefs[field.key];
+            let objectKey: string | null = null;
+
+            if (localFile) {
+              objectKey = await localFileToObjectKey(localFile);
+            } else if (photobankRef?.source === "photobank") {
+              objectKey = await photobankRefToObjectKey(photobankRef.path);
+            } else if (requestFields[field.key]) {
+              objectKey = requestFields[field.key];
+            }
+
+            if (!objectKey) {
+              return NextResponse.json(
+                {
+                  code: `E_PHOTO_REQUIRED_${field.key}`,
+                  field: field.key,
+                  error: `Photo is required for field ${field.key}`
+                },
+                { status: 400 }
+              );
+            }
+
+            requestFields[field.key] = objectKey;
+          } catch (error) {
+            const code = error instanceof Error ? error.message : "E_GENERATE_FAILED";
+            if (code === "E_UPLOAD_TOO_LARGE") {
+              return jsonError("E_UPLOAD_TOO_LARGE", "File is too large. Max 15MB", 400);
+            }
+            if (code === "E_UPLOAD_TYPE") {
+              return jsonError("E_UPLOAD_TYPE", "Unsupported image format. Allowed: JPEG, PNG, WEBP", 400);
+            }
+            if (code === "E_PHOTOBANK_DOWNLOAD") {
+              return jsonError("E_PHOTOBANK_DOWNLOAD", "Failed to download file from photobank", 500);
+            }
+            return jsonError("E_GENERATE_FAILED", "Failed to prepare images", 500);
+          }
+        }
+      }
+
       const rendered = await renderUniversalTemplate({
         templateId,
         fields: requestFields,
+        textSizeAdjust,
         frameNode: frameNode as Parameters<typeof renderUniversalTemplate>[0]["frameNode"],
         includeDebug: debugRender
       });
@@ -460,8 +757,8 @@ export async function POST(request: Request) {
       });
     }
 
-    const title = payload.title?.trim() ?? "";
-    const objectKey = payload.objectKey?.trim() ?? "";
+    const title = payload?.title?.trim() ?? "";
+    const objectKey = payload?.objectKey?.trim() ?? "";
 
     if (!templateId || !title || !objectKey) {
       return NextResponse.json(

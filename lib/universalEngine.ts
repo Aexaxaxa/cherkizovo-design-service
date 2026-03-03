@@ -9,9 +9,8 @@ import {
   type LayoutNode
 } from "@/lib/figmaLayout";
 import { buildRoundedRectPath } from "@/lib/roundedRectPath";
-import { getObject } from "@/lib/s3";
+import { getBufferCached, getObjectBuffer } from "@/lib/s3";
 import { toSafeFrameId } from "@/lib/snapshotStore";
-import { streamToBuffer } from "@/lib/streamToBuffer";
 import {
   buildSvgPathsForLines,
   getFontMetricsPx,
@@ -142,6 +141,23 @@ type MeasuredTextBlock = {
 };
 type LayoutBox = { x: number; y: number; width: number; height: number };
 
+export type TextSizeAdjust = -1 | 0 | 1;
+export type TextSizeAdjustMap = Record<string, TextSizeAdjust>;
+
+const TEXT_LINE_LIMITS: Record<string, number> = {
+  text_title: 4,
+  text_subtitle: 4,
+  text: 4,
+  text_quote: 9
+};
+
+export type TextLineLimitViolation = {
+  field: string;
+  maxLines: number;
+  actualLines: number;
+  code: string;
+};
+
 const ATOMIC_IMAGE_TYPES = new Set([
   "VECTOR",
   "INSTANCE",
@@ -181,7 +197,7 @@ function toInt(value: number): number {
 }
 
 function getNodeGap(node: Pick<LayoutNode, "itemSpacing">): number {
-  return node.itemSpacing !== undefined && node.itemSpacing !== null ? node.itemSpacing : 50;
+  return node.itemSpacing !== undefined && node.itemSpacing !== null ? node.itemSpacing : 0;
 }
 
 function ensureFinite(name: string, value: number): number {
@@ -435,21 +451,13 @@ async function createSolidRectLayer(
 }
 
 async function getUploadBuffer(objectKey: string): Promise<Buffer> {
-  const source = await getObject(objectKey);
-  if (!source.Body) {
-    throw new Error(`Source object body is empty for key ${objectKey}`);
-  }
-  return streamToBuffer(source.Body);
+  return getObjectBuffer(objectKey);
 }
 
 async function getSnapshotAssetBuffer(assetKey: string, cache: Map<string, Buffer>): Promise<Buffer> {
   const cached = cache.get(assetKey);
   if (cached) return cached;
-  const source = await getObject(assetKey);
-  if (!source.Body) {
-    throw new Error(`Snapshot asset body is empty for key ${assetKey}`);
-  }
-  const buffer = await streamToBuffer(source.Body);
+  const buffer = await getBufferCached(assetKey);
   cache.set(assetKey, buffer);
   return buffer;
 }
@@ -627,19 +635,14 @@ function getEditableTextValue(node: LayoutNode, fields: Record<string, string>, 
 async function measureTextBlock(
   node: LayoutNode,
   rawText: string,
-  maxTextWidth: number
+  maxTextWidth: number,
+  adjust: TextSizeAdjust
 ): Promise<MeasuredTextBlock> {
   const style = node.textStyle ?? {};
-  const fontSize = style.fontSize && style.fontSize > 0 ? style.fontSize : 16;
-  const lineHeightPx =
-    typeof style.lineHeightPx === "number" && style.lineHeightPx > 0
-      ? style.lineHeightPx
-      : typeof style.lineHeightPercentFontSize === "number" && style.lineHeightPercentFontSize > 0
-        ? fontSize * (style.lineHeightPercentFontSize / 100)
-        : typeof style.lineHeightPercent === "number" && style.lineHeightPercent > 0
-          ? fontSize * (style.lineHeightPercent / 100)
-        : fontSize;
-  const letterSpacing = typeof style.letterSpacing === "number" ? style.letterSpacing : 0;
+  const typography = resolveTypography(node, adjust);
+  const fontSize = typography.fontSize;
+  const lineHeightPx = typography.lineHeightPx;
+  const letterSpacing = typography.letterSpacing;
   const fontPath = resolveFontPath(style);
   const font = await loadFontCached(fontPath);
   const metrics = getFontMetricsPx(font, fontSize);
@@ -723,10 +726,27 @@ function getManualAssetType(name: string): "sticker" | "marks" | null {
   return null;
 }
 
+function getTemplateTextPostWidthLimit(templateName: string | undefined, nodeName: string): number | undefined {
+  if (nodeName.toLowerCase() !== "text_post") return undefined;
+  if (!templateName) return undefined;
+  if (templateName.startsWith("TPL_vk_post")) return 1399;
+  if (templateName.startsWith("TPL_start_post")) return 1888;
+  return undefined;
+}
+
+function applyTemplateWrapWidthLimit(innerWidth: number, nodeName: string, templateName: string | undefined): number {
+  const base = Math.max(1, innerWidth);
+  const limit = getTemplateTextPostWidthLimit(templateName, nodeName);
+  if (!limit) return base;
+  return Math.max(1, Math.min(base, limit));
+}
+
 async function renderEditableText(
   nodes: LayoutNode[],
   treeById: Map<string, LayoutNode>,
   fields: Record<string, string>,
+  textSizeAdjust: TextSizeAdjustMap,
+  templateName: string | undefined,
   frameX: number,
   frameY: number,
   frameW: number,
@@ -809,22 +829,24 @@ async function renderEditableText(
   const itemSpacing = container ? getNodeGap(container) : 0;
   const resolveWrapWidthForNode = (nodeIndex: number, innerW: number): number => {
     const childW = nodeWrapWidths[nodeIndex];
+    const nodeName = nodes[nodeIndex]?.name ?? "";
     if (
       isAutoLayoutContainer &&
       container?.layoutMode === "HORIZONTAL" &&
       typeof childW === "number" &&
       Number.isFinite(childW)
     ) {
-      return Math.max(1, Math.min(innerW, childW));
+      return applyTemplateWrapWidthLimit(Math.max(1, Math.min(innerW, childW)), nodeName, templateName);
     }
-    return Math.max(1, innerW);
+    return applyTemplateWrapWidthLimit(Math.max(1, innerW), nodeName, templateName);
   };
 
   const initialInnerW = maxTextWidth;
   const measuredA = await Promise.all(
     nodes.map((textNode, index) => {
       const wrapW = resolveWrapWidthForNode(index, initialInnerW);
-      return measureTextBlock(textNode, rawTexts[index], wrapW);
+      const adjust = normalizeTextSizeAdjust(textSizeAdjust[textNode.name]);
+      return measureTextBlock(textNode, rawTexts[index], wrapW, adjust);
     })
   );
   const measuredTextW_A = measuredA.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
@@ -839,7 +861,8 @@ async function renderEditableText(
   const measuredB = await Promise.all(
     nodes.map((textNode, index) => {
       const wrapW = resolveWrapWidthForNode(index, finalInnerW);
-      return measureTextBlock(textNode, rawTexts[index], wrapW);
+      const adjust = normalizeTextSizeAdjust(textSizeAdjust[textNode.name]);
+      return measureTextBlock(textNode, rawTexts[index], wrapW, adjust);
     })
   );
   const measuredTextW_B = measuredB.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
@@ -1082,6 +1105,253 @@ async function renderEditableText(
   };
 }
 
+type TextLineMetric = {
+  field: string;
+  linesCount: number;
+  wrapWidth: number;
+};
+
+function normalizeTextSizeAdjust(value: unknown): TextSizeAdjust {
+  if (value === -1 || value === 1) return value;
+  return 0;
+}
+
+function resolveTypography(node: LayoutNode, adjust: TextSizeAdjust): { fontSize: number; lineHeightPx: number; letterSpacing: number } {
+  const style = node.textStyle ?? {};
+  const baseFontSize = style.fontSize && style.fontSize > 0 ? style.fontSize : 16;
+  const fontSize = Math.max(1, baseFontSize + adjust * 10);
+
+  let lineHeightPx = fontSize;
+  if (typeof style.lineHeightPercentFontSize === "number" && style.lineHeightPercentFontSize > 0) {
+    lineHeightPx = fontSize * (style.lineHeightPercentFontSize / 100);
+  } else if (typeof style.lineHeightPercent === "number" && style.lineHeightPercent > 0) {
+    lineHeightPx = fontSize * (style.lineHeightPercent / 100);
+  } else if (typeof style.lineHeightPx === "number" && style.lineHeightPx > 0) {
+    lineHeightPx = baseFontSize > 0 ? style.lineHeightPx * (fontSize / baseFontSize) : style.lineHeightPx;
+  }
+
+  const letterSpacing = typeof style.letterSpacing === "number" ? style.letterSpacing : 0;
+  return { fontSize, lineHeightPx, letterSpacing };
+}
+
+async function measureEditableTextLinesForValidation(
+  nodes: LayoutNode[],
+  treeById: Map<string, LayoutNode>,
+  fields: Record<string, string>,
+  textSizeAdjust: TextSizeAdjustMap,
+  templateName: string | undefined,
+  frameX: number,
+  frameY: number,
+  frameW: number,
+  frameH: number,
+  forcedContainer?: LayoutNode,
+  computedContainerBox?: LayoutBox,
+  computedBoxes?: Map<string, LayoutBox>
+): Promise<TextLineMetric[]> {
+  if (nodes.length === 0) return [];
+  const node = nodes[0];
+  if (!node.bbox) return [];
+
+  const container = forcedContainer ?? findNearestResizableContainer(node, treeById);
+  const target = container ?? node;
+  const rawRel = computedContainerBox
+    ? { x: computedContainerBox.x, y: computedContainerBox.y, width: computedContainerBox.width, height: computedContainerBox.height }
+    : toRelativeBbox(target, frameX, frameY);
+  const safeRel = sanitizeBox(
+    rawRel ? { left: rawRel.x, top: rawRel.y, width: rawRel.width, height: rawRel.height } : null,
+    frameW,
+    frameH,
+    `text-validate:${target.name}:${target.id}`
+  );
+  if (!safeRel) return [];
+
+  const rel = { x: safeRel.left, y: safeRel.top, width: safeRel.width, height: safeRel.height };
+  const paddingLeft = container ? container.paddingLeft ?? 0 : 0;
+  const paddingRight = container ? container.paddingRight ?? 0 : 0;
+  const origW = Math.max(1, rel.width);
+  const marginSafe = 150;
+  const eps = 2;
+  const isFixed = isFixedContainer(container);
+
+  let anchor: "left" | "right" | "center" | "free" = "free";
+  if (container) {
+    const constraintHorizontal = container.constraints?.horizontal ?? node.constraints?.horizontal;
+    if (constraintHorizontal === "CENTER") {
+      anchor = "center";
+    } else if (constraintHorizontal === "LEFT") {
+      anchor = "left";
+    } else if (constraintHorizontal === "RIGHT") {
+      anchor = "right";
+    } else if (Math.abs(rel.x - 0) <= eps) {
+      anchor = "left";
+    } else if (Math.abs(rel.x + rel.width - frameW) <= eps) {
+      anchor = "right";
+    } else if (Math.abs(rel.x + rel.width / 2 - frameW / 2) <= 4) {
+      anchor = "center";
+    }
+  }
+
+  const maxWForAnchor = container
+    ? anchor === "center"
+      ? Math.max(1, frameW - marginSafe * 2)
+      : Math.max(1, frameW - marginSafe)
+    : Math.max(1, origW);
+  let maxTextWidth = container
+    ? Math.max(1, (isFixed ? origW : maxWForAnchor) - paddingLeft - paddingRight)
+    : Math.max(1, origW);
+  const isAutoLayoutContainer = Boolean(container && container.layoutMode && container.layoutMode !== "NONE");
+
+  const rawTexts = nodes.map((textNode) => getEditableTextValue(textNode, fields, new Set<string>()));
+  const nodeWrapWidths = nodes.map((textNode) => {
+    const childBox = computedBoxes?.get(textNode.id);
+    return childBox ? Math.max(1, childBox.width) : undefined;
+  });
+
+  const resolveWrapWidthForNode = (nodeIndex: number, innerW: number): number => {
+    const childW = nodeWrapWidths[nodeIndex];
+    const nodeName = nodes[nodeIndex]?.name ?? "";
+    if (
+      isAutoLayoutContainer &&
+      container?.layoutMode === "HORIZONTAL" &&
+      typeof childW === "number" &&
+      Number.isFinite(childW)
+    ) {
+      return applyTemplateWrapWidthLimit(Math.max(1, Math.min(innerW, childW)), nodeName, templateName);
+    }
+    return applyTemplateWrapWidthLimit(Math.max(1, innerW), nodeName, templateName);
+  };
+
+  const initialInnerW = maxTextWidth;
+  const measuredA = await Promise.all(
+    nodes.map((textNode, index) => {
+      const wrapW = resolveWrapWidthForNode(index, initialInnerW);
+      const adjust = normalizeTextSizeAdjust(textSizeAdjust[textNode.name]);
+      return measureTextBlock(textNode, rawTexts[index], wrapW, adjust);
+    })
+  );
+  const measuredTextW_A = measuredA.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
+  const tentativePillW = container
+    ? isFixed
+      ? origW
+      : clamp(measuredTextW_A + paddingLeft + paddingRight, 1, maxWForAnchor)
+    : origW;
+  const finalPillW = Math.max(1, tentativePillW);
+  const finalInnerW = container ? Math.max(1, finalPillW - paddingLeft - paddingRight) : Math.max(1, origW);
+  maxTextWidth = finalInnerW;
+
+  const measuredB = await Promise.all(
+    nodes.map((textNode, index) => {
+      const wrapW = resolveWrapWidthForNode(index, maxTextWidth);
+      const adjust = normalizeTextSizeAdjust(textSizeAdjust[textNode.name]);
+      return measureTextBlock(textNode, rawTexts[index], wrapW, adjust);
+    })
+  );
+
+  return nodes.map((textNode, index) => ({
+    field: textNode.name,
+    linesCount: measuredB[index]?.lines.length ?? 1,
+    wrapWidth: resolveWrapWidthForNode(index, maxTextWidth)
+  }));
+}
+
+export async function validateTextLineLimits(input: {
+  templateId: string;
+  frameNode: FigmaNodeLite;
+  fields: Record<string, string>;
+  textSizeAdjust?: TextSizeAdjustMap;
+}): Promise<TextLineLimitViolation | null> {
+  const tree = buildLayoutTree(input.frameNode as FigmaNodeLite);
+  const frame = tree.root;
+  if (!frame.bbox) return null;
+
+  const frameX = ensureFinite("frameX", frame.bbox.x);
+  const frameY = ensureFinite("frameY", frame.bbox.y);
+  const frameW = Math.max(1, ensureLayerGeometry(frame.bbox.width, 1));
+  const frameH = Math.max(1, ensureLayerGeometry(frame.bbox.height, 1));
+  const templateName = frame.name || undefined;
+
+  const allNodes = collectNodes(frame);
+  const nodeOrder = new Map<string, number>();
+  allNodes.forEach((node, index) => {
+    nodeOrder.set(node.id, index);
+  });
+
+  const editableTextNodes = allNodes.filter((node) => node.visible && getEditableKind(node.name) === "text");
+  const containerTextMap = new Map<string, LayoutNode[]>();
+  const handledTextNodeIds = new Set<string>();
+
+  for (const textNode of editableTextNodes) {
+    const container = findNearestResizableContainer(textNode, tree.byId);
+    if (!container) continue;
+    const list = containerTextMap.get(container.id) ?? [];
+    list.push(textNode);
+    containerTextMap.set(container.id, list);
+    handledTextNodeIds.add(textNode.id);
+  }
+
+  for (const [containerId, list] of containerTextMap.entries()) {
+    list.sort((a, b) => (nodeOrder.get(a.id) ?? 0) - (nodeOrder.get(b.id) ?? 0));
+    containerTextMap.set(containerId, list);
+  }
+
+  const computedBoxes = buildComputedLayoutBoxes(frame, frameX, frameY);
+
+  const groups: Array<{ nodes: LayoutNode[]; container?: LayoutNode; containerBox?: LayoutBox }> = [];
+  const sortedContainerGroups = [...containerTextMap.entries()].sort(
+    ([leftId], [rightId]) => (nodeOrder.get(leftId) ?? 0) - (nodeOrder.get(rightId) ?? 0)
+  );
+
+  for (const [containerId, nodes] of sortedContainerGroups) {
+    const container = tree.byId.get(containerId);
+    if (!container) continue;
+    groups.push({
+      nodes,
+      container,
+      containerBox: computedBoxes.get(container.id)
+    });
+  }
+
+  for (const node of editableTextNodes) {
+    if (handledTextNodeIds.has(node.id)) continue;
+    groups.push({
+      nodes: [node],
+      containerBox: computedBoxes.get(node.id)
+    });
+  }
+
+  for (const group of groups) {
+    const metrics = await measureEditableTextLinesForValidation(
+      group.nodes,
+      tree.byId,
+      input.fields,
+      input.textSizeAdjust ?? {},
+      templateName,
+      frameX,
+      frameY,
+      frameW,
+      frameH,
+      group.container,
+      group.containerBox,
+      computedBoxes
+    );
+
+    for (const metric of metrics) {
+      const normalizedField = metric.field.toLowerCase();
+      const maxLines = TEXT_LINE_LIMITS[normalizedField];
+      if (!maxLines) continue;
+      if (metric.linesCount <= maxLines) continue;
+      return {
+        field: metric.field,
+        maxLines,
+        actualLines: metric.linesCount,
+        code: `E_TEXT_TOO_LONG_${metric.field}`
+      };
+    }
+  }
+
+  return null;
+}
+
 function collectNodes(root: LayoutNode): LayoutNode[] {
   const out: LayoutNode[] = [];
 
@@ -1098,6 +1368,7 @@ function collectNodes(root: LayoutNode): LayoutNode[] {
 
 type RenderTreeContext = {
   templateId: string;
+  templateName?: string;
   frameX: number;
   frameY: number;
   frameW: number;
@@ -1116,6 +1387,7 @@ type RenderTreeContext = {
   skippedPhotoReason: string[];
   photoLayers: NonNullable<UniversalRenderDebug["photoLayers"]>;
   computedBoxes: Map<string, LayoutBox>;
+  textSizeAdjust: TextSizeAdjustMap;
 };
 
 function computeIntrinsicSize(
@@ -1350,6 +1622,8 @@ async function renderNodeTree(
       [node],
       context.treeById,
       context.fields,
+      context.textSizeAdjust,
+      context.templateName,
       context.frameX,
       context.frameY,
       context.frameW,
@@ -1374,6 +1648,8 @@ async function renderNodeTree(
       mappedTextNodes,
       context.treeById,
       context.fields,
+      context.textSizeAdjust,
+      context.templateName,
       context.frameX,
       context.frameY,
       context.frameW,
@@ -1523,6 +1799,7 @@ async function renderNodeTree(
 export async function renderUniversalTemplate(input: {
   templateId: string;
   fields: Record<string, string>;
+  textSizeAdjust?: TextSizeAdjustMap;
   frameNode: FigmaNodeLite;
   refresh?: boolean;
   includeDebug?: boolean;
@@ -1579,6 +1856,7 @@ export async function renderUniversalTemplate(input: {
   const computedBoxes = buildComputedLayoutBoxes(frame, frameX, frameY);
   const renderContext: RenderTreeContext = {
     templateId: input.templateId,
+    templateName: frame.name || undefined,
     frameX,
     frameY,
     frameW,
@@ -1596,7 +1874,8 @@ export async function renderUniversalTemplate(input: {
     skippedPhoto: false,
     skippedPhotoReason: [],
     photoLayers: [],
-    computedBoxes
+    computedBoxes,
+    textSizeAdjust: input.textSizeAdjust ?? {}
   };
   const allLayers = await renderNodeTree(frame, renderContext);
 

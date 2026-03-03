@@ -1,6 +1,5 @@
 import { getEnv } from "@/lib/env";
-import { getObject, putObject } from "@/lib/s3";
-import { streamToBuffer } from "@/lib/streamToBuffer";
+import { getJsonCached, putObject } from "@/lib/s3";
 
 export type SnapshotTemplate = {
   id: string;
@@ -61,12 +60,7 @@ function isNotFoundError(error: unknown): boolean {
 }
 
 export async function readSnapshotJson<T>(key: string): Promise<T> {
-  const object = await getObject(key);
-  if (!object.Body) {
-    throw new Error(`Snapshot body is empty: ${key}`);
-  }
-  const buffer = await streamToBuffer(object.Body);
-  return JSON.parse(buffer.toString("utf-8")) as T;
+  return getJsonCached<T>(key);
 }
 
 export async function tryReadSnapshotJson<T>(key: string): Promise<T | null> {

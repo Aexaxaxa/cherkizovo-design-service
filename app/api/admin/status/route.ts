@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createMetaDefaults, readAdminSyncMeta } from "@/lib/adminSyncState";
 import { getEnv } from "@/lib/env";
+import { FigmaAccessForbiddenError, runWithFigmaAccessBlocked } from "@/lib/figmaAccessGuard";
 
 export const runtime = "nodejs";
 
@@ -21,12 +22,24 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  const env = getEnv();
-  const fileKey = env.FIGMA_FILE_KEY?.trim();
-  if (!fileKey) {
-    return NextResponse.json({ error: "Missing FIGMA_FILE_KEY" }, { status: 500 });
-  }
+  try {
+    return await runWithFigmaAccessBlocked("GET /api/admin/status", async () => {
+      const env = getEnv();
+      const fileKey = env.FIGMA_FILE_KEY?.trim();
+      if (!fileKey) {
+        return NextResponse.json({ error: "Missing FIGMA_FILE_KEY" }, { status: 500 });
+      }
 
-  const meta = await readAdminSyncMeta(fileKey).catch(() => createMetaDefaults(fileKey));
-  return NextResponse.json(meta);
+      const meta = await readAdminSyncMeta(fileKey).catch(() => createMetaDefaults(fileKey));
+      return NextResponse.json(meta);
+    });
+  } catch (error) {
+    if (error instanceof FigmaAccessForbiddenError) {
+      console.error(`[admin/status] Forbidden Figma access attempt: ${error.message}`);
+      return NextResponse.json({ error: "Status endpoint must not access Figma" }, { status: 500 });
+    }
+
+    console.error("[admin/status] Failed to read sync status", error);
+    return NextResponse.json({ error: "Failed to read sync status" }, { status: 500 });
+  }
 }

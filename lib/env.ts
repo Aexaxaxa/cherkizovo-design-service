@@ -9,6 +9,13 @@ type RuntimeEnv = {
   FIGMA_CACHE_TTL_SEC: number;
   FIGMA_PREVIEW_SCALE: number;
   DEBUG_RENDER?: string;
+  CACHE_ENABLED: boolean;
+  CACHE_JSON_TTL_SEC: number;
+  CACHE_ASSET_TTL_SEC: number;
+  CACHE_JSON_MAX_ITEMS: number;
+  CACHE_ASSET_MAX_BYTES: number;
+  CACHE_ASSET_MAX_ITEMS: number;
+  CACHE_DEBUG: boolean;
   B2_BUCKET_NAME: string;
   B2_S3_REGION: string;
   B2_S3_ENDPOINT: string;
@@ -16,6 +23,7 @@ type RuntimeEnv = {
   B2_SECRET_ACCESS_KEY: string;
   MAX_UPLOAD_MB: number;
   SIGNED_URL_EXPIRES_SEC: number;
+  YADISK_PUBLIC_KEY?: string;
 };
 
 let cachedEnv: RuntimeEnv | null = null;
@@ -52,6 +60,14 @@ function getFloatEnv(name: string, fallback: number): number {
   return value;
 }
 
+function getBooleanEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (!raw || raw.trim().length === 0) {
+    return fallback;
+  }
+  return raw.trim() === "1";
+}
+
 export function getEnv(): RuntimeEnv {
   if (cachedEnv) {
     return cachedEnv;
@@ -68,13 +84,21 @@ export function getEnv(): RuntimeEnv {
     FIGMA_CACHE_TTL_SEC: getNumberEnv("FIGMA_CACHE_TTL_SEC", 900),
     FIGMA_PREVIEW_SCALE: getFloatEnv("FIGMA_PREVIEW_SCALE", 0.25),
     DEBUG_RENDER: process.env.DEBUG_RENDER,
+    CACHE_ENABLED: getBooleanEnv("CACHE_ENABLED", true),
+    CACHE_JSON_TTL_SEC: getNumberEnv("CACHE_JSON_TTL_SEC", 600),
+    CACHE_ASSET_TTL_SEC: getNumberEnv("CACHE_ASSET_TTL_SEC", 3600),
+    CACHE_JSON_MAX_ITEMS: getNumberEnv("CACHE_JSON_MAX_ITEMS", 500),
+    CACHE_ASSET_MAX_BYTES: getNumberEnv("CACHE_ASSET_MAX_BYTES", 268435456),
+    CACHE_ASSET_MAX_ITEMS: getNumberEnv("CACHE_ASSET_MAX_ITEMS", 200),
+    CACHE_DEBUG: getBooleanEnv("CACHE_DEBUG", false),
     B2_BUCKET_NAME: getRequiredEnv("B2_BUCKET_NAME"),
     B2_S3_REGION: getRequiredEnv("B2_S3_REGION"),
     B2_S3_ENDPOINT: getRequiredEnv("B2_S3_ENDPOINT"),
     B2_ACCESS_KEY_ID: getRequiredEnv("B2_ACCESS_KEY_ID"),
     B2_SECRET_ACCESS_KEY: getRequiredEnv("B2_SECRET_ACCESS_KEY"),
     MAX_UPLOAD_MB: getNumberEnv("MAX_UPLOAD_MB", 10),
-    SIGNED_URL_EXPIRES_SEC: getNumberEnv("SIGNED_URL_EXPIRES_SEC", 900)
+    SIGNED_URL_EXPIRES_SEC: getNumberEnv("SIGNED_URL_EXPIRES_SEC", 900),
+    YADISK_PUBLIC_KEY: process.env.YADISK_PUBLIC_KEY?.trim() || undefined
   };
 
   return cachedEnv;

@@ -1,4 +1,5 @@
 import { getFigmaEnv } from "@/lib/env";
+import { assertFigmaAccessAllowed } from "@/lib/figmaAccessGuard";
 
 const FIGMA_BASE_URL = "https://api.figma.com";
 const FIGMA_TIMEOUT_MS = 15_000;
@@ -96,6 +97,7 @@ async function figmaFetchRawWithOptions(
   asBytes: boolean,
   options: FigmaFetchOptions
 ): Promise<{ data: unknown; meta: FigmaResponseMeta }> {
+  assertFigmaAccessAllowed();
   const { FIGMA_TOKEN } = getFigmaEnv();
   const url = resolveFigmaUrl(pathOrUrl);
   const maxRetries = Number.isInteger(options.maxRetries) ? Math.max(0, options.maxRetries ?? 0) : FIGMA_MAX_RETRIES;

@@ -8,6 +8,11 @@ const browseCache = new LruTtlCache<PhotobankBrowseResult>({
   debug: false,
   name: "photobank"
 });
+const previewCache = new LruTtlCache<string>({
+  maxItems: 300,
+  debug: false,
+  name: "photobank-preview"
+});
 
 export type PhotobankItem =
   | {
@@ -43,6 +48,7 @@ type YadiskResourceItem = {
 
 type YadiskBrowseResponse = {
   path?: string;
+  preview?: string;
   _embedded?: {
     items?: YadiskResourceItem[];
     total?: number;
@@ -78,6 +84,10 @@ function normalizePath(path: string | null | undefined): string {
 
 function buildBrowseCacheKey(path: string, limit: number, offset: number): string {
   return `${path}|${limit}|${offset}`;
+}
+
+function buildPreviewCacheKey(path: string, previewSize: string): string {
+  return `preview|${path}|${previewSize}`;
 }
 
 export async function browsePhotobank(input: {
@@ -183,4 +193,41 @@ export async function resolvePhotobankDownloadHref(path: string): Promise<string
     throw new Error("Yandex download href is missing");
   }
   return payload.href;
+}
+
+export async function resolvePhotobankPreviewUrl(path: string, previewSize = "XL"): Promise<string> {
+  const normalizedPath = normalizePath(path);
+  if (!normalizedPath) {
+    throw new Error("path is required");
+  }
+
+  const safeSize = typeof previewSize === "string" && previewSize.trim() ? previewSize.trim() : "XL";
+  const cacheKey = buildPreviewCacheKey(normalizedPath, safeSize);
+
+  return previewCache.getOrSetAsync(cacheKey, BROWSE_TTL_MS, async () => {
+    const url = new URL(YADISK_API_BASE);
+    url.searchParams.set("public_key", getPublicKey());
+    url.searchParams.set("path", normalizedPath);
+    url.searchParams.set("preview_size", safeSize);
+    url.searchParams.set("preview_crop", "false");
+
+    const response = await fetch(url.toString(), { cache: "no-store" });
+    if (!response.ok) {
+      if (isPhotobankDebugEnabled()) {
+        const body = await response.text().catch(() => "");
+        console.error("[photobank:preview]", {
+          status: response.status,
+          url: url.toString(),
+          body
+        });
+      }
+      throw new Error(`Yandex preview failed: ${response.status}`);
+    }
+
+    const payload = (await response.json()) as YadiskBrowseResponse;
+    if (!payload.preview || typeof payload.preview !== "string") {
+      throw new Error("Yandex preview is missing");
+    }
+    return payload.preview;
+  });
 }

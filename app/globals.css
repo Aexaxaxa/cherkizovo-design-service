@@ -257,6 +257,101 @@ button:disabled {
   padding: 16px;
 }
 
+.crop-modal-card {
+  width: min(980px, 100%);
+}
+
+.crop-stage {
+  position: relative;
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+  background: #111;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.crop-preview-wrap {
+  position: relative;
+  width: 100%;
+  min-height: 220px;
+}
+
+.crop-stage-preview {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  opacity: 0.35;
+}
+
+.crop-stage-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+}
+
+.crop-area-container {
+  position: absolute;
+  border: 2px solid #ffffff;
+  overflow: visible;
+  touch-action: none;
+  z-index: 4;
+}
+
+.crop-area-container .reactEasyCrop_Container {
+  width: 100%;
+  height: 100%;
+}
+
+.crop-area-container .reactEasyCrop_CropArea {
+  border: 0;
+}
+
+.crop-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  padding: 0;
+  border-radius: 999px;
+  border: 2px solid #ffffff;
+  background: #d7262d;
+  z-index: 5;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+}
+
+.crop-handles-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 6;
+}
+
+.crop-outside-mask-part {
+  position: absolute;
+  background: rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  z-index: 3;
+}
+
+.crop-loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.5);
+  z-index: 7;
+}
+
 .modal-header {
   display: flex;
   align-items: center;

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getEnv } from "@/lib/env";
 import { get, getEntry, set } from "@/lib/memoryCache";
-import { getSchemaSnapshotKey, readSnapshotJson, type SnapshotTemplate } from "@/lib/snapshotStore";
+import { getFrameSnapshotKey, getSchemaSnapshotKey, readSnapshotJson } from "@/lib/snapshotStore";
 
 export const runtime = "nodejs";
 
@@ -14,8 +14,131 @@ type SchemaField = {
 type SchemaPayload = {
   templateId: string;
   templateName: string;
+  frame: {
+    width: number;
+    height: number;
+  } | null;
+  photoFields: Array<{
+    name: string;
+    nodeId: string;
+    box: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    };
+    cornerRadii?: [number, number, number, number];
+  }>;
   fields: SchemaField[];
 };
+
+type FrameSnapshotNode = {
+  id?: string;
+  name?: string;
+  visible?: boolean;
+  cornerRadius?: number;
+  rectangleCornerRadii?: number[];
+  absoluteBoundingBox?: {
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+  };
+  children?: FrameSnapshotNode[];
+};
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function normalizeRadii(node: FrameSnapshotNode): [number, number, number, number] | undefined {
+  if (
+    Array.isArray(node.rectangleCornerRadii) &&
+    node.rectangleCornerRadii.length >= 4 &&
+    node.rectangleCornerRadii.every((value) => isFiniteNumber(value))
+  ) {
+    return [
+      node.rectangleCornerRadii[0] as number,
+      node.rectangleCornerRadii[1] as number,
+      node.rectangleCornerRadii[2] as number,
+      node.rectangleCornerRadii[3] as number
+    ];
+  }
+  if (isFiniteNumber(node.cornerRadius)) {
+    return [node.cornerRadius, node.cornerRadius, node.cornerRadius, node.cornerRadius];
+  }
+  return undefined;
+}
+
+function extractPhotoGeometryFromFrame(frameNode: FrameSnapshotNode): Pick<SchemaPayload, "frame" | "photoFields"> {
+  const frameBox = frameNode.absoluteBoundingBox;
+  if (
+    !frameBox ||
+    !isFiniteNumber(frameBox.x) ||
+    !isFiniteNumber(frameBox.y) ||
+    !isFiniteNumber(frameBox.width) ||
+    !isFiniteNumber(frameBox.height) ||
+    frameBox.width <= 0 ||
+    frameBox.height <= 0
+  ) {
+    return {
+      frame: null,
+      photoFields: []
+    };
+  }
+
+  const frame = {
+    width: Math.round(frameBox.width),
+    height: Math.round(frameBox.height)
+  };
+  const frameX = frameBox.x;
+  const frameY = frameBox.y;
+
+  const photoFields: SchemaPayload["photoFields"] = [];
+
+  function walk(node: FrameSnapshotNode) {
+    if (node.visible === false) return;
+
+    const name = typeof node.name === "string" ? node.name.trim() : "";
+    const lower = name.toLowerCase();
+    const bbox = node.absoluteBoundingBox;
+    if (
+      name &&
+      lower.startsWith("photo") &&
+      node.id &&
+      bbox &&
+      isFiniteNumber(bbox.x) &&
+      isFiniteNumber(bbox.y) &&
+      isFiniteNumber(bbox.width) &&
+      isFiniteNumber(bbox.height) &&
+      bbox.width > 0 &&
+      bbox.height > 0
+    ) {
+      photoFields.push({
+        name,
+        nodeId: node.id,
+        box: {
+          x: Math.max(0, Math.round(bbox.x - frameX)),
+          y: Math.max(0, Math.round(bbox.y - frameY)),
+          width: Math.max(1, Math.round(bbox.width)),
+          height: Math.max(1, Math.round(bbox.height))
+        },
+        cornerRadii: normalizeRadii(node)
+      });
+    }
+
+    for (const child of node.children ?? []) {
+      walk(child);
+    }
+  }
+
+  walk(frameNode);
+
+  return {
+    frame,
+    photoFields
+  };
+}
 
 function isNotFoundError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -46,7 +169,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     return NextResponse.json({ error: "Missing FIGMA_FILE_KEY" }, { status: 500 });
   }
 
-  const cacheKey = `${fileKey}:schema:v1:${frameId}`;
+  const cacheKey = `${fileKey}:schema:v2:${frameId}`;
 
   try {
     if (!refresh) {
@@ -67,7 +190,21 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 
     try {
       const key = getSchemaSnapshotKey(fileKey, frameId);
-      const payload = await readSnapshotJson<SchemaPayload>(key);
+      const schemaSnapshot = await readSnapshotJson<{
+        templateId: string;
+        templateName: string;
+        fields: SchemaField[];
+      }>(key);
+      const frameSnapshot = await readSnapshotJson<FrameSnapshotNode>(getFrameSnapshotKey(fileKey, frameId));
+      const geometry = extractPhotoGeometryFromFrame(frameSnapshot);
+      const payload: SchemaPayload = {
+        templateId: schemaSnapshot.templateId,
+        templateName: schemaSnapshot.templateName,
+        fields: schemaSnapshot.fields,
+        frame: geometry.frame,
+        photoFields: geometry.photoFields
+      };
+
       set(cacheKey, payload, env.FIGMA_SCHEMA_TTL_SEC);
 
       if (debug) {

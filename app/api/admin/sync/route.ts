@@ -384,6 +384,7 @@ export async function POST(request: Request) {
         await writeSnapshotJson(getSchemaSnapshotKey(fileKey, tpl.id), {
           templateId: tpl.id,
           templateName: normalizeName(frameDoc.name) || tpl.id,
+          frame: schema.frame,
           fields: schema.fields
         });
         meta.schemasSaved += 1;

@@ -39,6 +39,17 @@ type SchemaField = {
 type SchemaPayload = {
   templateId: string;
   templateName: string;
+  photoFields?: Array<{
+    name: string;
+    nodeId: string;
+    box: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    };
+    cornerRadii?: [number, number, number, number];
+  }>;
   fields: SchemaField[];
 };
 
@@ -49,12 +60,38 @@ type PhotobankRef = {
   previewUrl?: string;
 };
 
+type CropPixels = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type CropNorm = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+type PhotoEdit = {
+  cropNorm?: CropNorm;
+  cropPixels?: CropPixels;
+  zoom?: number;
+};
+
 type MultipartGenerateInput = {
   templateId: string;
   textFields: Record<string, string>;
   textSizeAdjust: TextSizeAdjustMap;
   photoRefs: Record<string, PhotobankRef>;
+  photoEdits: Record<string, PhotoEdit>;
   files: Record<string, File>;
+};
+
+type PreparedPhoto = {
+  buffer: Buffer;
+  mimeType: string;
 };
 
 const SUPPORTED_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -122,6 +159,13 @@ function jsonError(code: string, error: string, status: number): NextResponse {
   return NextResponse.json({ code, error }, { status });
 }
 
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
 async function parseMultipartGenerateInput(request: Request): Promise<MultipartGenerateInput> {
   const formData = await request.formData();
   const templateId = String(formData.get("templateId") ?? "").trim();
@@ -171,6 +215,58 @@ async function parseMultipartGenerateInput(request: Request): Promise<MultipartG
     }
   }
 
+  let photoEdits: Record<string, PhotoEdit> = {};
+  const rawPhotoEdits = formData.get("photoEdits");
+  if (typeof rawPhotoEdits === "string" && rawPhotoEdits.trim()) {
+    const parsed = JSON.parse(rawPhotoEdits) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      photoEdits = {};
+      for (const [field, value] of Object.entries(parsed)) {
+        if (!value || typeof value !== "object") continue;
+
+        const edit: PhotoEdit = {
+          zoom: "zoom" in value && typeof value.zoom === "number" ? value.zoom : undefined
+        };
+
+        if ("cropNorm" in value && value.cropNorm && typeof value.cropNorm === "object") {
+          const cropNormRaw = value.cropNorm as { x?: unknown; y?: unknown; w?: unknown; h?: unknown };
+          const x = Number(cropNormRaw.x);
+          const y = Number(cropNormRaw.y);
+          const w = Number(cropNormRaw.w);
+          const h = Number(cropNormRaw.h);
+          if ([x, y, w, h].every((n) => Number.isFinite(n))) {
+            edit.cropNorm = {
+              x: clamp01(x),
+              y: clamp01(y),
+              w: clamp01(w),
+              h: clamp01(h)
+            };
+          }
+        }
+
+        if ("cropPixels" in value && value.cropPixels && typeof value.cropPixels === "object") {
+          const cropRaw = value.cropPixels as { x?: unknown; y?: unknown; width?: unknown; height?: unknown };
+          const x = Number(cropRaw.x);
+          const y = Number(cropRaw.y);
+          const width = Number(cropRaw.width);
+          const height = Number(cropRaw.height);
+          if ([x, y, width, height].every((n) => Number.isFinite(n))) {
+            edit.cropPixels = {
+              x: Math.round(x),
+              y: Math.round(y),
+              width: Math.round(width),
+              height: Math.round(height)
+            };
+          }
+        }
+
+        if (edit.cropNorm || edit.cropPixels) {
+          photoEdits[field] = edit;
+        }
+      }
+    }
+  }
+
   const files: Record<string, File> = {};
   for (const [key, value] of formData.entries()) {
     if (value instanceof File) {
@@ -183,11 +279,12 @@ async function parseMultipartGenerateInput(request: Request): Promise<MultipartG
     textFields,
     textSizeAdjust,
     photoRefs,
+    photoEdits,
     files
   };
 }
 
-async function localFileToObjectKey(file: File): Promise<string> {
+async function localFileToPreparedPhoto(file: File): Promise<PreparedPhoto> {
   const mimeType = normalizeMimeType(file.type);
   if (!mimeType) {
     throw new Error("E_UPLOAD_TYPE");
@@ -195,11 +292,13 @@ async function localFileToObjectKey(file: File): Promise<string> {
   if (file.size > MAX_FILE_BYTES) {
     throw new Error("E_UPLOAD_TOO_LARGE");
   }
-  const body = Buffer.from(await file.arrayBuffer());
-  return uploadBufferToB2(body, mimeType);
+  return {
+    buffer: Buffer.from(await file.arrayBuffer()),
+    mimeType
+  };
 }
 
-async function photobankRefToObjectKey(path: string): Promise<string> {
+async function photobankRefToPreparedPhoto(path: string): Promise<PreparedPhoto> {
   let response: Response;
   try {
     const href = await resolvePhotobankDownloadHref(path);
@@ -230,7 +329,70 @@ async function photobankRefToObjectKey(path: string): Promise<string> {
     throw new Error("E_UPLOAD_TOO_LARGE");
   }
 
-  return uploadBufferToB2(body, mimeType);
+  return {
+    buffer: body,
+    mimeType
+  };
+}
+
+async function encodeByMime(image: sharp.Sharp, mimeType: string): Promise<Buffer> {
+  if (mimeType === "image/jpeg") {
+    return image.jpeg().toBuffer();
+  }
+  if (mimeType === "image/webp") {
+    return image.webp().toBuffer();
+  }
+  return image.png().toBuffer();
+}
+
+async function applyPhotoEdit(input: PreparedPhoto, edit: PhotoEdit, target?: { width: number; height: number }): Promise<PreparedPhoto> {
+  const metadata = await sharp(input.buffer).metadata();
+  const sourceWidth = metadata.width ?? 0;
+  const sourceHeight = metadata.height ?? 0;
+  if (sourceWidth <= 0 || sourceHeight <= 0) {
+    throw new Error("E_CROP_OUT_OF_BOUNDS");
+  }
+
+  let crop: CropPixels | null = null;
+  if (edit.cropNorm) {
+    const norm = edit.cropNorm;
+    const left = Math.round(norm.x * sourceWidth);
+    const top = Math.round(norm.y * sourceHeight);
+    const width = Math.round(norm.w * sourceWidth);
+    const height = Math.round(norm.h * sourceHeight);
+    crop = { x: left, y: top, width, height };
+  } else if (edit.cropPixels) {
+    crop = edit.cropPixels;
+  }
+  if (!crop) {
+    return input;
+  }
+
+  const left = Math.max(0, Math.min(sourceWidth - 1, Math.round(crop.x)));
+  const top = Math.max(0, Math.min(sourceHeight - 1, Math.round(crop.y)));
+  const maxWidth = sourceWidth - left;
+  const maxHeight = sourceHeight - top;
+  const width = Math.max(1, Math.min(maxWidth, Math.round(crop.width)));
+  const height = Math.max(1, Math.min(maxHeight, Math.round(crop.height)));
+  if (width <= 0 || height <= 0) {
+    throw new Error("E_CROP_OUT_OF_BOUNDS");
+  }
+
+  let image = sharp(input.buffer).extract({
+    left,
+    top,
+    width,
+    height
+  });
+
+  if (target && target.width > 0 && target.height > 0) {
+    image = image.resize(target.width, target.height, { fit: "cover" });
+  }
+
+  return {
+    buffer: await encodeByMime(image, input.mimeType),
+    mimeType: input.mimeType
+  };
 }
 
 type FigmaRenderDebug = {
@@ -687,11 +849,30 @@ export async function POST(request: Request) {
             const localFile = multipartInput.files[field.key];
             const photobankRef = multipartInput.photoRefs[field.key];
             let objectKey: string | null = null;
+            const photoGeometry = schemaPayload.photoFields?.find(
+              (item) => item.name.toLowerCase() === field.key.toLowerCase()
+            );
+            const target =
+              photoGeometry && photoGeometry.box.width > 0 && photoGeometry.box.height > 0
+                ? {
+                    width: photoGeometry.box.width,
+                    height: photoGeometry.box.height
+                  }
+                : undefined;
+            const edit = multipartInput.photoEdits[field.key];
 
             if (localFile) {
-              objectKey = await localFileToObjectKey(localFile);
+              let photo = await localFileToPreparedPhoto(localFile);
+              if (edit) {
+                photo = await applyPhotoEdit(photo, edit, target);
+              }
+              objectKey = await uploadBufferToB2(photo.buffer, photo.mimeType);
             } else if (photobankRef?.source === "photobank") {
-              objectKey = await photobankRefToObjectKey(photobankRef.path);
+              let photo = await photobankRefToPreparedPhoto(photobankRef.path);
+              if (edit) {
+                photo = await applyPhotoEdit(photo, edit, target);
+              }
+              objectKey = await uploadBufferToB2(photo.buffer, photo.mimeType);
             } else if (requestFields[field.key]) {
               objectKey = requestFields[field.key];
             }
@@ -718,6 +899,9 @@ export async function POST(request: Request) {
             }
             if (code === "E_PHOTOBANK_DOWNLOAD") {
               return jsonError("E_PHOTOBANK_DOWNLOAD", "Failed to download file from photobank", 500);
+            }
+            if (code === "E_CROP_OUT_OF_BOUNDS") {
+              return jsonError("E_CROP_OUT_OF_BOUNDS", "Crop is outside image bounds", 400);
             }
             return jsonError("E_GENERATE_FAILED", "Failed to prepare images", 500);
           }

@@ -1,7 +1,15 @@
 ﻿"use client";
 
 import Cropper, { type Area } from "react-easy-crop";
-import { use, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  use,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent
+} from "react";
 
 type SchemaField = {
   key: string;
@@ -86,13 +94,6 @@ type PhotoSelection =
     }
   | PhotobankRef;
 
-type CropPixels = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-
 type CropNorm = {
   x: number;
   y: number;
@@ -102,32 +103,36 @@ type CropNorm = {
 
 type PhotoEditState = {
   cropNorm: CropNorm;
-  zoom?: number;
 };
 
-type CropRectPx = {
-  left: number;
-  top: number;
+type PhotoBox = {
+  x: number;
+  y: number;
   width: number;
   height: number;
 };
 
-type MediaSize = {
+type CropEditorState = {
+  fieldName: string;
+  sourceType: "upload" | "photobank";
+  imageUrl: string;
+  imageNaturalWidth: number;
+  imageNaturalHeight: number;
+  frameWidth: number;
+  frameHeight: number;
+  photoBox: PhotoBox;
+  previewUrl: string | null;
+  crop: { x: number; y: number };
+  zoom: number;
+  cropNorm: CropNorm | null;
+} | null;
+
+type CropAreaSize = {
   width: number;
   height: number;
 };
 
-type CropHandle =
-  | "top-left"
-  | "top"
-  | "top-right"
-  | "right"
-  | "bottom-right"
-  | "bottom"
-  | "bottom-left"
-  | "left";
-
-type ImgRect = {
+type ImageRect = {
   left: number;
   top: number;
   right: number;
@@ -136,13 +141,30 @@ type ImgRect = {
   height: number;
 };
 
-type ResizeState = {
+type ResizeHandleKey = "top-left" | "top-right" | "bottom-right" | "bottom-left";
+
+type ResizeHandleState = {
   pointerId: number;
-  handle: CropHandle;
+  handle: ResizeHandleKey;
+  startPointer: {
+    x: number;
+    y: number;
+  };
   startZoom: number;
-  startCrop: { x: number; y: number };
-  startImgRect: ImgRect;
-  handleElement: HTMLButtonElement | null;
+  startCrop: {
+    x: number;
+    y: number;
+  };
+  startImgRect: ImageRect;
+  startDisplaySize: {
+    width: number;
+    height: number;
+  };
+};
+
+type CropMediaSize = {
+  width: number;
+  height: number;
 };
 
 function asUiError(code: string, message: string): UiError {
@@ -218,58 +240,22 @@ function clamp01(value: number): number {
   return value;
 }
 
-async function createDownscaledPreviewUrl(file: File, maxSide = 1600): Promise<string> {
-  const srcUrl = URL.createObjectURL(file);
-  try {
-    const bitmap = await createImageBitmap(file);
-    const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
-    const targetWidth = Math.max(1, Math.round(bitmap.width * scale));
-    const targetHeight = Math.max(1, Math.round(bitmap.height * scale));
-    const canvas = document.createElement("canvas");
-    canvas.width = targetWidth;
-    canvas.height = targetHeight;
-    const context = canvas.getContext("2d");
-    if (!context) {
-      return srcUrl;
-    }
-    context.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
-    const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, "image/jpeg", 0.92)
-    );
-    bitmap.close();
-    if (!blob) {
-      return srcUrl;
-    }
-    URL.revokeObjectURL(srcUrl);
-    return URL.createObjectURL(blob);
-  } catch {
-    return srcUrl;
-  }
-}
-
-function isDebugUiEnabled(): boolean {
-  return process.env.NEXT_PUBLIC_DEBUG_UI === "1" || process.env.DEBUG_UI === "1";
-}
-
-function debugUi(message: string, payload?: unknown): void {
-  if (!isDebugUiEnabled()) return;
-  if (payload === undefined) {
-    console.debug(`[crop-ui] ${message}`);
-    return;
-  }
-  console.debug(`[crop-ui] ${message}`, payload);
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, code = "E_CROP_PREVIEW_TIMEOUT"): Promise<T> {
-  return await Promise.race([
-    promise,
-    new Promise<T>((_, reject) => {
-      const timer = setTimeout(() => {
-        clearTimeout(timer);
-        reject(new Error(code));
-      }, timeoutMs);
-    })
-  ]);
+async function measureImageSize(url: string): Promise<{ width: number; height: number }> {
+  return await new Promise<{ width: number; height: number }>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      if (!Number.isFinite(image.naturalWidth) || !Number.isFinite(image.naturalHeight) || image.naturalWidth <= 0 || image.naturalHeight <= 0) {
+        reject(new Error("E_CROP_IMAGE_INVALID_SIZE"));
+        return;
+      }
+      resolve({
+        width: image.naturalWidth,
+        height: image.naturalHeight
+      });
+    };
+    image.onerror = () => reject(new Error("E_CROP_IMAGE_LOAD_FAILED"));
+    image.src = url;
+  });
 }
 
 export default function TemplateEditorPage({
@@ -309,34 +295,24 @@ export default function TemplateEditorPage({
   const [photobankLoadingMore, setPhotobankLoadingMore] = useState(false);
   const [photobankError, setPhotobankError] = useState<string | null>(null);
   const [folderNameByPath, setFolderNameByPath] = useState<Record<string, string>>({});
-  const [cropOpen, setCropOpen] = useState(false);
-  const [cropFieldKey, setCropFieldKey] = useState<string | null>(null);
-  const [cropPosition, setCropPosition] = useState({ x: 0, y: 0 });
-  const [cropZoom, setCropZoom] = useState(1);
-  const [cropNormDraft, setCropNormDraft] = useState<CropNorm | null>(null);
-  const [cropRectPx, setCropRectPx] = useState<CropRectPx | null>(null);
-  const [cropPreviewLoaded, setCropPreviewLoaded] = useState(false);
-  const [cropMediaSize, setCropMediaSize] = useState<MediaSize | null>(null);
-  const [cropInitialized, setCropInitialized] = useState(false);
-  const [cropUiImageSrc, setCropUiImageSrc] = useState("");
-  const [cropPreparingField, setCropPreparingField] = useState<string | null>(null);
+  const [cropEditor, setCropEditor] = useState<CropEditorState>(null);
+  const [cropAreaSize, setCropAreaSize] = useState<CropAreaSize>({ width: 0, height: 0 });
+  const [cropMediaSize, setCropMediaSize] = useState<CropMediaSize | null>(null);
 
   const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
-  const cropStageRef = useRef<HTMLDivElement | null>(null);
+  const cropObjectUrlRef = useRef<string | null>(null);
   const cropPreviewWrapRef = useRef<HTMLDivElement | null>(null);
-  const cropPreviewImgRef = useRef<HTMLImageElement | null>(null);
+  const cropAreaRef = useRef<HTMLDivElement | null>(null);
   const cropperContainerRef = useRef<HTMLDivElement | null>(null);
-  const resizeStateRef = useRef<ResizeState | null>(null);
-  const cropUiObjectUrlRef = useRef<string | null>(null);
-  const cropMeasureRafRef = useRef<number | null>(null);
-  const cropResizeObserverRef = useRef<ResizeObserver | null>(null);
+  const resizeHandleStateRef = useRef<ResizeHandleState | null>(null);
 
-  const clearCropUiImage = useCallback(() => {
-    if (cropUiObjectUrlRef.current) {
-      URL.revokeObjectURL(cropUiObjectUrlRef.current);
-      cropUiObjectUrlRef.current = null;
+  const closeCropEditor = useCallback(() => {
+    if (cropObjectUrlRef.current) {
+      URL.revokeObjectURL(cropObjectUrlRef.current);
+      cropObjectUrlRef.current = null;
     }
-    setCropUiImageSrc("");
+    setCropMediaSize(null);
+    setCropEditor(null);
   }, []);
 
   const textFields = useMemo(() => schemaFields.filter((field) => field.type === "text"), [schemaFields]);
@@ -470,12 +446,8 @@ export default function TemplateEditorPage({
     setActivePhotoField(null);
     setCurrentFolderName(null);
     setFolderNameByPath({});
-    setCropOpen(false);
-    setCropFieldKey(null);
-    setCropNormDraft(null);
-    setCropPreparingField(null);
-    clearCropUiImage();
-  }, [clearCropUiImage, decodedId]);
+    closeCropEditor();
+  }, [closeCropEditor, decodedId]);
 
   useEffect(() => {
     void loadSchema();
@@ -561,378 +533,122 @@ export default function TemplateEditorPage({
     await loadPhotobank("", false, null);
   }
 
-  const cropFieldLabel = useMemo(
-    () => imageFields.find((field) => field.key === cropFieldKey)?.label ?? cropFieldKey ?? "",
-    [cropFieldKey, imageFields]
+  const getPhotoFieldGeometry = useCallback(
+    (fieldName: string) => schemaPhotoFields.find((item) => item.name.toLowerCase() === fieldName.toLowerCase()) ?? null,
+    [schemaPhotoFields]
   );
 
-  const cropFieldGeometry = useMemo(() => {
-    if (!cropFieldKey) return null;
-    const lower = cropFieldKey.toLowerCase();
-    return schemaPhotoFields.find((item) => item.name.toLowerCase() === lower) ?? null;
-  }, [cropFieldKey, schemaPhotoFields]);
+  const cropFieldLabel = useMemo(
+    () => imageFields.find((field) => field.key === cropEditor?.fieldName)?.label ?? cropEditor?.fieldName ?? "",
+    [cropEditor?.fieldName, imageFields]
+  );
 
-  const recalcCropRect = useCallback(
-    (attempt = 0) => {
-      if (!cropFieldGeometry || !schemaFrame || !cropPreviewWrapRef.current) {
-        setCropRectPx(null);
-        return;
-      }
-
-      const wrapperRect = cropPreviewWrapRef.current.getBoundingClientRect();
-      const hasSize = wrapperRect.width > 0 && wrapperRect.height > 0;
-      if (!hasSize) {
-        if (attempt < 10) {
-          if (cropMeasureRafRef.current) {
-            cancelAnimationFrame(cropMeasureRafRef.current);
-          }
-          cropMeasureRafRef.current = requestAnimationFrame(() => recalcCropRect(attempt + 1));
-          return;
-        }
-        const friendly = asUiError("E_CROP_PREVIEW_NOT_READY", "Не удалось подготовить область обрезки. Попробуйте снова.");
+  const openCropEditor = useCallback(
+    async (fieldName: string) => {
+      const selection = photoSelections[fieldName];
+      if (!selection) {
+        const friendly = asUiError("E_CROP_REQUIRED", "Сначала выберите фото для обрезки");
         setError(friendly);
         setStatus(friendly.message);
-        setCropPreparingField(null);
-        debugUi("cropRect failed after retries", { attempt });
+        return;
+      }
+      if (!schemaFrame) {
+        const friendly = asUiError("E_SCHEMA_FRAME_MISSING", "В шаблоне отсутствует frame для обрезки");
+        setError(friendly);
+        setStatus(friendly.message);
         return;
       }
 
-      const scaleX = wrapperRect.width / schemaFrame.width;
-      const scaleY = wrapperRect.height / schemaFrame.height;
-      const scale = Math.min(scaleX, scaleY);
-      const nextRect = {
-        left: cropFieldGeometry.box.x * scale,
-        top: cropFieldGeometry.box.y * scale,
-        width: cropFieldGeometry.box.width * scale,
-        height: cropFieldGeometry.box.height * scale
-      };
-      setCropRectPx(nextRect);
-      setCropPreparingField(null);
-      setStatus("");
-      debugUi("cropRect ready", nextRect);
-    },
-    [cropFieldGeometry, schemaFrame]
-  );
+      const geometry = getPhotoFieldGeometry(fieldName);
+      if (!geometry) {
+        const friendly = asUiError("E_PHOTO_GEOMETRY_MISSING", `В этом шаблоне нет слоя ${fieldName}`);
+        setError(friendly);
+        setStatus(friendly.message);
+        return;
+      }
 
-  const getImageRect = useCallback(
-    (zoom: number, crop: { x: number; y: number }, mediaSize: MediaSize, cropRect: CropRectPx): ImgRect => {
-      const imgW = mediaSize.width * zoom;
-      const imgH = mediaSize.height * zoom;
-      const centerX = cropRect.width / 2 + crop.x;
-      const centerY = cropRect.height / 2 + crop.y;
-      const left = centerX - imgW / 2;
-      const top = centerY - imgH / 2;
-      return {
-        left,
-        top,
-        right: left + imgW,
-        bottom: top + imgH,
-        width: imgW,
-        height: imgH
-      };
-    },
-    []
-  );
+      if (cropObjectUrlRef.current) {
+        URL.revokeObjectURL(cropObjectUrlRef.current);
+        cropObjectUrlRef.current = null;
+      }
 
-  const imgRect = useMemo(() => {
-    if (!cropRectPx || !cropMediaSize) return null;
-    return getImageRect(cropZoom, cropPosition, cropMediaSize, cropRectPx);
-  }, [cropMediaSize, cropPosition, cropRectPx, cropZoom, getImageRect]);
-
-  const handleDescriptors = useMemo(() => {
-    if (!imgRect || !cropRectPx) return [];
-    const clampX = (value: number) => Math.max(0, Math.min(cropRectPx.width, value));
-    const clampY = (value: number) => Math.max(0, Math.min(cropRectPx.height, value));
-
-    const left = clampX(imgRect.left);
-    const right = clampX(imgRect.right);
-    const top = clampY(imgRect.top);
-    const bottom = clampY(imgRect.bottom);
-    const centerX = clampX((imgRect.left + imgRect.right) / 2);
-    const centerY = clampY((imgRect.top + imgRect.bottom) / 2);
-
-    return [
-      { key: "top-left" as const, x: left, y: top, cursor: "nwse-resize" },
-      { key: "top" as const, x: centerX, y: top, cursor: "ns-resize" },
-      { key: "top-right" as const, x: right, y: top, cursor: "nesw-resize" },
-      { key: "right" as const, x: right, y: centerY, cursor: "ew-resize" },
-      { key: "bottom-right" as const, x: right, y: bottom, cursor: "nwse-resize" },
-      { key: "bottom" as const, x: centerX, y: bottom, cursor: "ns-resize" },
-      { key: "bottom-left" as const, x: left, y: bottom, cursor: "nesw-resize" },
-      { key: "left" as const, x: left, y: centerY, cursor: "ew-resize" }
-    ];
-  }, [cropRectPx, imgRect]);
-
-  async function openCropModal(fieldKey: string) {
-    const selection = photoSelections[fieldKey];
-    debugUi("open click", {
-      fieldKey,
-      hasSelection: Boolean(selection),
-      source: selection?.source,
-      hasFile: selection?.source === "local" ? Boolean(selection.file) : false,
-      photobankPath: selection?.source === "photobank" ? selection.path : undefined
-    });
-    if (!selection) {
-      const friendly = asUiError("E_CROP_REQUIRED", "Сначала выберите фото для обрезки");
-      setError(friendly);
-      setStatus(friendly.message);
-      return;
-    }
-
-    const geometry = schemaPhotoFields.find((item) => item.name.toLowerCase() === fieldKey.toLowerCase());
-    if (!geometry || !schemaFrame) {
-      const friendly = asUiError("E_PHOTO_GEOMETRY_MISSING", `В этом шаблоне нет слоя ${fieldKey}`);
-      setError(friendly);
-      setStatus(friendly.message);
-      return;
-    }
-
-    let nextCropUiSrc = "";
-    setCropPreparingField(fieldKey);
-    setError(null);
-    setStatus("Подготовка обрезки...");
-    try {
+      let imageUrl = "";
+      let sourceType: "upload" | "photobank" = "photobank";
       if (selection.source === "local") {
-        nextCropUiSrc = await withTimeout(createDownscaledPreviewUrl(selection.file, 1600), 10_000);
-        if (cropUiObjectUrlRef.current) {
-          URL.revokeObjectURL(cropUiObjectUrlRef.current);
-        }
-        cropUiObjectUrlRef.current = nextCropUiSrc;
+        sourceType = "upload";
+        imageUrl = URL.createObjectURL(selection.file);
+        cropObjectUrlRef.current = imageUrl;
       } else {
-        const response = await withTimeout(
-          fetch(`/api/photobank/preview?path=${encodeURIComponent(selection.path)}&size=XL`, {
-            cache: "no-store"
-          }),
-          10_000
-        );
-        const payload = (await response.json().catch(() => null)) as { previewUrl?: string } | null;
-        nextCropUiSrc = payload?.previewUrl && response.ok ? payload.previewUrl : selection.previewUrl;
+        sourceType = "photobank";
+        imageUrl = selection.previewUrl;
       }
-    } catch (errorUnknown) {
-      const code =
-        errorUnknown instanceof Error && errorUnknown.message === "E_CROP_PREVIEW_TIMEOUT"
-          ? "E_CROP_PREVIEW_TIMEOUT"
-          : "E_CROP_PREVIEW_FAILED";
-      debugUi("preview prepare error", {
-        fieldKey,
-        code,
-        error: errorUnknown instanceof Error ? errorUnknown.message : String(errorUnknown)
-      });
-      nextCropUiSrc = selection.source === "photobank" ? selection.previewUrl : (localPreviewUrls[fieldKey] ?? URL.createObjectURL(selection.file));
-      if (selection.source === "local" && !cropUiObjectUrlRef.current && nextCropUiSrc.startsWith("blob:")) {
-        cropUiObjectUrlRef.current = nextCropUiSrc;
+
+      try {
+        const { width: imageNaturalWidth, height: imageNaturalHeight } = await measureImageSize(imageUrl);
+        // react-easy-crop uses zoom as a multiplier of already-fitted media.
+        const initialZoom = 1;
+        const existingCrop = photoEdits[fieldName]?.cropNorm ?? null;
+
+        setCropEditor({
+          fieldName,
+          sourceType,
+          imageUrl,
+          imageNaturalWidth,
+          imageNaturalHeight,
+          frameWidth: schemaFrame.width,
+          frameHeight: schemaFrame.height,
+          photoBox: geometry.box,
+          previewUrl,
+          crop: { x: 0, y: 0 },
+          zoom: initialZoom,
+          cropNorm: existingCrop
+        });
+        setCropMediaSize(null);
+        setError(null);
+        setStatus("");
+      } catch (err) {
+        if (cropObjectUrlRef.current && cropObjectUrlRef.current === imageUrl) {
+          URL.revokeObjectURL(cropObjectUrlRef.current);
+          cropObjectUrlRef.current = null;
+        }
+        const message = err instanceof Error ? err.message : "E_CROP_IMAGE_LOAD_FAILED";
+        const friendly = asUiError(message, "Не удалось подготовить изображение для обрезки");
+        setError(friendly);
+        setStatus(friendly.message);
       }
-      const friendly = asUiError(
-        code,
-        code === "E_CROP_PREVIEW_TIMEOUT"
-          ? "Превью для обрезки готовится слишком долго. Попробуйте снова."
-          : "Не удалось подготовить превью в высоком качестве. Использовано базовое превью."
-      );
-      setStatus(friendly.message);
-    }
+    },
+    [getPhotoFieldGeometry, photoEdits, photoSelections, previewUrl, schemaFrame]
+  );
 
-    if (!nextCropUiSrc) {
-      const friendly = asUiError("E_CROP_PREVIEW_FAILED", "Не удалось подготовить изображение для обрезки");
-      setError(friendly);
-      setStatus(friendly.message);
-      setCropPreparingField(null);
-      return;
-    }
-
-    const existing = photoEdits[fieldKey];
-    setCropUiImageSrc(nextCropUiSrc);
-    setCropFieldKey(fieldKey);
-    setCropPosition({ x: 0, y: 0 });
-    setCropZoom(existing?.zoom && Number.isFinite(existing.zoom) ? existing.zoom : 1);
-    setCropNormDraft(existing?.cropNorm ?? null);
-    setCropRectPx(null);
-    setCropPreviewLoaded(true);
-    setCropMediaSize(null);
-    setCropInitialized(false);
-    setCropOpen(true);
-    setStatus("Подготовка обрезки...");
-    debugUi("crop opened", { fieldKey, source: selection.source });
-  }
-
-  function confirmCrop() {
-    if (!cropFieldKey || !cropNormDraft) {
+  const confirmCropEditor = useCallback(() => {
+    if (!cropEditor || !cropEditor.cropNorm) {
       const friendly = asUiError("E_CROP_REQUIRED", "Не удалось сохранить обрезку. Попробуйте еще раз");
       setError(friendly);
       setStatus(friendly.message);
       return;
     }
-
+    const nextCropNorm = cropEditor.cropNorm;
     setPhotoEdits((prev) => ({
       ...prev,
-      [cropFieldKey]: {
-        cropNorm: cropNormDraft,
-        zoom: cropZoom
+      [cropEditor.fieldName]: {
+        cropNorm: nextCropNorm
       }
     }));
-    setCropOpen(false);
-    setCropFieldKey(null);
-    setCropNormDraft(null);
-    setCropPreparingField(null);
-    clearCropUiImage();
-    setCropInitialized(false);
-  }
+    closeCropEditor();
+  }, [closeCropEditor, cropEditor]);
 
-  function cancelCrop() {
-    setCropOpen(false);
-    setCropFieldKey(null);
-    setCropNormDraft(null);
-    setCropPreparingField(null);
-    clearCropUiImage();
-    setCropInitialized(false);
-  }
-
-  const onHandlePointerMove = useCallback((event: PointerEvent) => {
-    const state = resizeStateRef.current;
-    const container = cropperContainerRef.current;
-    const mediaSize = cropMediaSize;
-    if (!state || !container || !mediaSize) return;
-
-    const containerRect = container.getBoundingClientRect();
-    const pointerX = event.clientX - containerRect.left;
-    const pointerY = event.clientY - containerRect.top;
-    const leftFixed = state.startImgRect.left;
-    const rightFixed = state.startImgRect.right;
-    const topFixed = state.startImgRect.top;
-    const bottomFixed = state.startImgRect.bottom;
-
-    const handle = state.handle;
-    const hasLeft = handle === "left" || handle === "top-left" || handle === "bottom-left";
-    const hasRight = handle === "right" || handle === "top-right" || handle === "bottom-right";
-    const hasTop = handle === "top" || handle === "top-left" || handle === "top-right";
-    const hasBottom = handle === "bottom" || handle === "bottom-left" || handle === "bottom-right";
-
-    let widthFromPointer = 0;
-    let heightFromPointer = 0;
-    if (hasRight) widthFromPointer = Math.max(1, pointerX - leftFixed);
-    if (hasLeft) widthFromPointer = Math.max(1, rightFixed - pointerX);
-    if (hasBottom) heightFromPointer = Math.max(1, pointerY - topFixed);
-    if (hasTop) heightFromPointer = Math.max(1, bottomFixed - pointerY);
-
-    let nextZoom = state.startZoom;
-    if (hasLeft || hasRight) {
-      nextZoom = widthFromPointer / mediaSize.width;
-    }
-    if (hasTop || hasBottom) {
-      const zoomByHeight = heightFromPointer / mediaSize.height;
-      nextZoom = hasLeft || hasRight ? Math.max(nextZoom, zoomByHeight) : zoomByHeight;
-    }
-    nextZoom = Math.max(1, Math.min(6, nextZoom));
-
-    const nextW = mediaSize.width * nextZoom;
-    const nextH = mediaSize.height * nextZoom;
-
-    let centerX = cropRectPx ? cropRectPx.width / 2 + state.startCrop.x : 0;
-    let centerY = cropRectPx ? cropRectPx.height / 2 + state.startCrop.y : 0;
-
-    if (hasRight) centerX = leftFixed + nextW / 2;
-    if (hasLeft) centerX = rightFixed - nextW / 2;
-    if (hasBottom) centerY = topFixed + nextH / 2;
-    if (hasTop) centerY = bottomFixed - nextH / 2;
-
-    if (!cropRectPx) return;
-    setCropZoom(nextZoom);
-    setCropPosition({
-      x: centerX - cropRectPx.width / 2,
-      y: centerY - cropRectPx.height / 2
-    });
-  }, [cropMediaSize, cropRectPx]);
-
-  const stopHandleZoom = useCallback(() => {
-    if (resizeStateRef.current?.handleElement && resizeStateRef.current.handleElement.hasPointerCapture(resizeStateRef.current.pointerId)) {
-      resizeStateRef.current.handleElement.releasePointerCapture(resizeStateRef.current.pointerId);
-    }
-    resizeStateRef.current = null;
-    window.removeEventListener("pointermove", onHandlePointerMove);
-  }, [onHandlePointerMove]);
-
-  const onHandlePointerUp = useCallback((event: PointerEvent) => {
-    const state = resizeStateRef.current;
-    if (!state) return;
-    if (event.pointerId !== state.pointerId) return;
-    window.removeEventListener("pointerup", onHandlePointerUp);
-    window.removeEventListener("pointercancel", onHandlePointerUp);
-    stopHandleZoom();
-  }, [stopHandleZoom]);
-
-  const startHandleZoom = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (!cropRectPx || !imgRect) return;
-    const handle = event.currentTarget.dataset.handle as CropHandle | undefined;
-    if (!handle) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    resizeStateRef.current = {
-      pointerId: event.pointerId,
-      handle,
-      startZoom: cropZoom,
-      startCrop: cropPosition,
-      startImgRect: imgRect,
-      handleElement: event.currentTarget
-    };
-
-    window.addEventListener("pointermove", onHandlePointerMove);
-    window.addEventListener("pointerup", onHandlePointerUp);
-    window.addEventListener("pointercancel", onHandlePointerUp);
-  }, [cropPosition, cropRectPx, cropZoom, imgRect, onHandlePointerMove, onHandlePointerUp]);
-
-  useEffect(() => {
-    if (!cropOpen) return;
-    if (!cropFieldGeometry || !schemaFrame) return;
-    recalcCropRect(0);
-
-    const observerTarget = cropPreviewWrapRef.current;
-    if (observerTarget && typeof ResizeObserver !== "undefined") {
-      cropResizeObserverRef.current?.disconnect();
-      cropResizeObserverRef.current = new ResizeObserver(() => recalcCropRect(0));
-      cropResizeObserverRef.current.observe(observerTarget);
-    }
-
-    const onResize = () => recalcCropRect(0);
-    window.addEventListener("resize", onResize);
-    return () => {
-      window.removeEventListener("resize", onResize);
-      cropResizeObserverRef.current?.disconnect();
-      cropResizeObserverRef.current = null;
-      if (cropMeasureRafRef.current) {
-        cancelAnimationFrame(cropMeasureRafRef.current);
-        cropMeasureRafRef.current = null;
-      }
-    };
-  }, [cropFieldGeometry, cropOpen, recalcCropRect, schemaFrame]);
-
-  useEffect(() => {
-    if (!cropOpen || !previewUrl || !cropPreviewImgRef.current) return;
-    if (!cropPreviewImgRef.current.complete) return;
-    setCropPreviewLoaded(true);
-  }, [cropOpen, previewUrl]);
-
-  useEffect(() => {
-    if (!cropOpen || cropInitialized || !cropRectPx || !cropMediaSize) return;
-    const initialZoom = Math.max(cropRectPx.width / cropMediaSize.width, cropRectPx.height / cropMediaSize.height, 1);
-    setCropPosition({ x: 0, y: 0 });
-    setCropZoom(initialZoom);
-    setCropInitialized(true);
-  }, [cropInitialized, cropMediaSize, cropOpen, cropRectPx]);
+  const cancelCropEditor = useCallback(() => {
+    closeCropEditor();
+  }, [closeCropEditor]);
 
   useEffect(
     () => () => {
-      window.removeEventListener("pointerup", onHandlePointerUp);
-      window.removeEventListener("pointercancel", onHandlePointerUp);
-      stopHandleZoom();
-      cropResizeObserverRef.current?.disconnect();
-      cropResizeObserverRef.current = null;
-      if (cropMeasureRafRef.current) {
-        cancelAnimationFrame(cropMeasureRafRef.current);
-        cropMeasureRafRef.current = null;
+      if (cropObjectUrlRef.current) {
+        URL.revokeObjectURL(cropObjectUrlRef.current);
+        cropObjectUrlRef.current = null;
       }
-      clearCropUiImage();
     },
-    [clearCropUiImage, onHandlePointerUp, stopHandleZoom]
+    []
   );
 
   function validateBeforeGenerate(): UiError | null {
@@ -1062,8 +778,230 @@ export default function TemplateEditorPage({
     : currentFolderName
       ? `Фотобанк: ${currentFolderName}`
       : "Фотобанк";
-  const isInlineCropping = Boolean(
-    cropOpen && cropFieldKey && cropFieldGeometry?.box && schemaFrame && cropUiImageSrc
+  const showResultView = Boolean(cropEditor === null && resultUrl);
+  const cropBoxStyle = useMemo(() => {
+    if (!cropEditor) return undefined;
+    return {
+      left: `${(cropEditor.photoBox.x / cropEditor.frameWidth) * 100}%`,
+      top: `${(cropEditor.photoBox.y / cropEditor.frameHeight) * 100}%`,
+      width: `${(cropEditor.photoBox.width / cropEditor.frameWidth) * 100}%`,
+      height: `${(cropEditor.photoBox.height / cropEditor.frameHeight) * 100}%`
+    };
+  }, [cropEditor]);
+  const imageRect = useMemo<ImageRect | null>(() => {
+    if (!cropEditor || !cropMediaSize) return null;
+    if (cropAreaSize.width <= 0 || cropAreaSize.height <= 0) return null;
+    const imgW = cropMediaSize.width * cropEditor.zoom;
+    const imgH = cropMediaSize.height * cropEditor.zoom;
+    const centerX = cropAreaSize.width / 2 + cropEditor.crop.x;
+    const centerY = cropAreaSize.height / 2 + cropEditor.crop.y;
+    const left = centerX - imgW / 2;
+    const top = centerY - imgH / 2;
+    return {
+      left,
+      top,
+      right: left + imgW,
+      bottom: top + imgH,
+      width: imgW,
+      height: imgH
+    };
+  }, [cropAreaSize.height, cropAreaSize.width, cropEditor, cropMediaSize]);
+  const resizeHandles = useMemo(() => {
+    if (!imageRect) return [];
+    return [
+      { key: "top-left" as const, x: imageRect.left, y: imageRect.top, cursor: "nwse-resize" },
+      { key: "top-right" as const, x: imageRect.right, y: imageRect.top, cursor: "nesw-resize" },
+      { key: "bottom-right" as const, x: imageRect.right, y: imageRect.bottom, cursor: "nwse-resize" },
+      { key: "bottom-left" as const, x: imageRect.left, y: imageRect.bottom, cursor: "nesw-resize" }
+    ];
+  }, [imageRect]);
+
+  useEffect(() => {
+    if (!cropEditor || !cropAreaRef.current) {
+      setCropAreaSize({ width: 0, height: 0 });
+      return;
+    }
+    const node = cropAreaRef.current;
+    const measure = () => {
+      setCropAreaSize({
+        width: node.clientWidth,
+        height: node.clientHeight
+      });
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [cropEditor]);
+
+  const onResizeHandlePointerMove = useCallback((event: PointerEvent) => {
+    const state = resizeHandleStateRef.current;
+    const node = cropperContainerRef.current;
+    if (!state || !node) return;
+    if (event.pointerId !== state.pointerId) return;
+    const areaRect = node.getBoundingClientRect();
+    const pointerX = event.clientX - areaRect.left;
+    const pointerY = event.clientY - areaRect.top;
+    const deltaX = pointerX - state.startPointer.x;
+    const deltaY = pointerY - state.startPointer.y;
+
+    let movedX = 0;
+    let movedY = 0;
+    let anchorX = 0;
+    let anchorY = 0;
+    if (state.handle === "top-left") {
+      movedX = state.startImgRect.left + deltaX;
+      movedY = state.startImgRect.top + deltaY;
+      anchorX = state.startImgRect.right;
+      anchorY = state.startImgRect.bottom;
+    } else if (state.handle === "top-right") {
+      movedX = state.startImgRect.right + deltaX;
+      movedY = state.startImgRect.top + deltaY;
+      anchorX = state.startImgRect.left;
+      anchorY = state.startImgRect.bottom;
+    } else if (state.handle === "bottom-right") {
+      movedX = state.startImgRect.right + deltaX;
+      movedY = state.startImgRect.bottom + deltaY;
+      anchorX = state.startImgRect.left;
+      anchorY = state.startImgRect.top;
+    } else {
+      movedX = state.startImgRect.left + deltaX;
+      movedY = state.startImgRect.bottom + deltaY;
+      anchorX = state.startImgRect.right;
+      anchorY = state.startImgRect.top;
+    }
+
+    const widthFromPointer = Math.max(1, Math.abs(movedX - anchorX));
+    const heightFromPointer = Math.max(1, Math.abs(movedY - anchorY));
+    const zoomFromWidth = (widthFromPointer / state.startImgRect.width) * state.startZoom;
+    const zoomFromHeight = (heightFromPointer / state.startImgRect.height) * state.startZoom;
+    let nextZoom = Math.max(zoomFromWidth, zoomFromHeight);
+    if (!Number.isFinite(nextZoom)) return;
+    nextZoom = Math.max(0.1, Math.min(8, nextZoom));
+    const nextW = state.startDisplaySize.width * nextZoom;
+    const nextH = state.startDisplaySize.height * nextZoom;
+    if (!Number.isFinite(nextW) || !Number.isFinite(nextH)) return;
+
+    let nextLeft = 0;
+    let nextTop = 0;
+    if (state.handle === "top-left") {
+      nextLeft = anchorX - nextW;
+      nextTop = anchorY - nextH;
+    } else if (state.handle === "top-right") {
+      nextLeft = anchorX;
+      nextTop = anchorY - nextH;
+    } else if (state.handle === "bottom-right") {
+      nextLeft = anchorX;
+      nextTop = anchorY;
+    } else {
+      nextLeft = anchorX - nextW;
+      nextTop = anchorY;
+    }
+
+    const startCenterX = state.startImgRect.left + state.startImgRect.width / 2;
+    const startCenterY = state.startImgRect.top + state.startImgRect.height / 2;
+    const nextCenterX = nextLeft + nextW / 2;
+    const nextCenterY = nextTop + nextH / 2;
+    const nextCropX = state.startCrop.x + (nextCenterX - startCenterX);
+    const nextCropY = state.startCrop.y + (nextCenterY - startCenterY);
+    if (!Number.isFinite(nextCropX) || !Number.isFinite(nextCropY)) return;
+    if (process.env.NEXT_PUBLIC_DEBUG_UI === "1" || process.env.DEBUG_UI === "1") {
+      console.debug("resize move", {
+        handle: state.handle,
+        startZoom: state.startZoom,
+        newZoom: nextZoom,
+        startImgRect: state.startImgRect,
+        pointerX,
+        pointerY
+      });
+    }
+    setCropEditor((prev) =>
+      prev
+        ? {
+            ...prev,
+            zoom: nextZoom,
+            crop: {
+              x: nextCropX,
+              y: nextCropY
+            }
+          }
+        : prev
+    );
+  }, []);
+
+  const onResizeHandlePointerUp = useCallback(
+    (event: PointerEvent) => {
+      const state = resizeHandleStateRef.current;
+      if (!state) return;
+      if (event.pointerId !== state.pointerId) return;
+      const node = cropperContainerRef.current;
+      if (node && node.hasPointerCapture(state.pointerId)) {
+        node.releasePointerCapture(state.pointerId);
+      }
+      resizeHandleStateRef.current = null;
+      window.removeEventListener("pointermove", onResizeHandlePointerMove);
+      window.removeEventListener("pointerup", onResizeHandlePointerUp);
+      window.removeEventListener("pointercancel", onResizeHandlePointerUp);
+    },
+    [onResizeHandlePointerMove]
+  );
+
+  const onResizeHandlePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (!imageRect || !cropEditor || !cropMediaSize) return;
+      const handle = event.currentTarget.dataset.handle as ResizeHandleKey | undefined;
+      if (!handle) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const node = cropperContainerRef.current;
+      if (!node) return;
+      if (cropMediaSize.width <= 0 || cropMediaSize.height <= 0) return;
+      const areaRect = node.getBoundingClientRect();
+      const startPointerX = event.clientX - areaRect.left;
+      const startPointerY = event.clientY - areaRect.top;
+      if (!Number.isFinite(startPointerX) || !Number.isFinite(startPointerY)) return;
+
+      resizeHandleStateRef.current = {
+        pointerId: event.pointerId,
+        handle,
+        startPointer: {
+          x: startPointerX,
+          y: startPointerY
+        },
+        startZoom: cropEditor.zoom,
+        startCrop: {
+          x: cropEditor.crop.x,
+          y: cropEditor.crop.y
+        },
+        startImgRect: { ...imageRect },
+        startDisplaySize: {
+          width: cropMediaSize.width,
+          height: cropMediaSize.height
+        }
+      };
+
+      node.setPointerCapture(event.pointerId);
+      window.addEventListener("pointermove", onResizeHandlePointerMove);
+      window.addEventListener("pointerup", onResizeHandlePointerUp);
+      window.addEventListener("pointercancel", onResizeHandlePointerUp);
+    },
+    [cropEditor, cropMediaSize, imageRect, onResizeHandlePointerMove, onResizeHandlePointerUp]
+  );
+
+  useEffect(
+    () => () => {
+      const state = resizeHandleStateRef.current;
+      const node = cropperContainerRef.current;
+      if (state && node && node.hasPointerCapture(state.pointerId)) {
+        node.releasePointerCapture(state.pointerId);
+      }
+      resizeHandleStateRef.current = null;
+      window.removeEventListener("pointermove", onResizeHandlePointerMove);
+      window.removeEventListener("pointerup", onResizeHandlePointerUp);
+      window.removeEventListener("pointercancel", onResizeHandlePointerUp);
+    },
+    [onResizeHandlePointerMove, onResizeHandlePointerUp]
   );
 
   return (
@@ -1130,7 +1068,6 @@ export default function TemplateEditorPage({
         {imageFields.map((field) => {
           const selection = photoSelections[field.key] ?? null;
           const hasPhoto = Boolean(selection);
-          const isPreparingCropForField = cropPreparingField === field.key;
           const localPreview = localPreviewUrls[field.key];
           const previewSrc =
             selection && selection.source === "photobank" ? selection.previewUrl : selection && selection.source === "local" ? localPreview : "";
@@ -1151,27 +1088,27 @@ export default function TemplateEditorPage({
                 </button>
                 <button
                   type="button"
-                  onClick={() => void openCropModal(field.key)}
-                  disabled={isGenerating || !hasPhoto || isPreparingCropForField}
+                  onClick={() => void openCropEditor(field.key)}
+                  disabled={isGenerating || !hasPhoto}
                 >
-                  {isPreparingCropForField ? "Подготовка..." : "Обрезать фото"}
+                  Обрезать фото
                 </button>
                 {hasPhoto ? (
                   <button
                     type="button"
-                    onClick={() =>
-                      {
-                        setPhotoSelections((prev) => ({
-                          ...prev,
-                          [field.key]: null
-                        }));
-                        setPhotoEdits((prev) => {
-                          const next = { ...prev };
-                          delete next[field.key];
-                          return next;
-                        });
-                      }
-                    }
+                    onClick={() => {
+                      setPhotoSelections((prev) => ({
+                        ...prev,
+                        [field.key]: null
+                      }));
+                      setPhotoEdits((prev) => {
+                        const next = { ...prev };
+                        delete next[field.key];
+                        return next;
+                      });
+                      closeCropEditor();
+                      setStatus("");
+                    }}
                     disabled={isGenerating}
                   >
                     Сбросить
@@ -1198,6 +1135,8 @@ export default function TemplateEditorPage({
                     delete next[field.key];
                     return next;
                   });
+                  closeCropEditor();
+                  setStatus("");
                   event.currentTarget.value = "";
                 }}
               />
@@ -1229,113 +1168,63 @@ export default function TemplateEditorPage({
         </div>
 
         <div className="field-block">
-          {isInlineCropping ? (
+          {cropEditor ? (
             <>
               <p className="muted">Обрезка фото: {cropFieldLabel}</p>
               <div className="result-preview-wrap">
-                <div className="crop-stage" ref={cropStageRef}>
+                <div className="crop-stage">
                   <div
-                    ref={cropPreviewWrapRef}
                     className="crop-preview-wrap"
-                    style={schemaFrame ? { aspectRatio: `${schemaFrame.width} / ${schemaFrame.height}` } : undefined}
+                    ref={cropPreviewWrapRef}
+                    style={{ aspectRatio: `${cropEditor.frameWidth} / ${cropEditor.frameHeight}` }}
                   >
-                    {previewUrl ? (
-                      <img
-                        ref={cropPreviewImgRef}
-                        src={previewUrl}
-                        alt="Template preview"
-                        className="crop-stage-preview"
-                        onLoad={() => {
-                          setCropPreviewLoaded(true);
-                        }}
-                      />
-                    ) : (
-                      <div className="crop-stage-empty">Preview шаблона недоступен</div>
-                    )}
-
-                    {cropRectPx ? (
-                      <>
-                        <div
-                          className="crop-outside-mask-part"
-                          style={{
-                            left: 0,
-                            top: 0,
-                            width: "100%",
-                            height: cropRectPx.top
-                          }}
-                        />
-                        <div
-                          className="crop-outside-mask-part"
-                          style={{
-                            left: 0,
-                            top: cropRectPx.top + cropRectPx.height,
-                            width: "100%",
-                            bottom: 0
-                          }}
-                        />
-                        <div
-                          className="crop-outside-mask-part"
-                          style={{
-                            left: 0,
-                            top: cropRectPx.top,
-                            width: cropRectPx.left,
-                            height: cropRectPx.height
-                          }}
-                        />
-                        <div
-                          className="crop-outside-mask-part"
-                          style={{
-                            left: cropRectPx.left + cropRectPx.width,
-                            top: cropRectPx.top,
-                            right: 0,
-                            height: cropRectPx.height
-                          }}
-                        />
-                      </>
+                    {cropEditor.previewUrl ? (
+                      <img src={cropEditor.previewUrl} alt="Template preview" className="crop-stage-preview" />
                     ) : null}
-
-                    {cropRectPx ? (
-                      <div
-                        ref={cropperContainerRef}
-                        className="crop-area-container"
-                        style={{
-                          left: cropRectPx.left,
-                          top: cropRectPx.top,
-                          width: cropRectPx.width,
-                          height: cropRectPx.height
-                        }}
-                        onWheelCapture={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                        }}
-                      >
+                    <div
+                      className="crop-area-container"
+                      style={cropBoxStyle}
+                      ref={(node) => {
+                        cropAreaRef.current = node;
+                        cropperContainerRef.current = node;
+                      }}
+                    >
+                      <div className="cropper-host">
                         <Cropper
-                          image={cropUiImageSrc}
-                          crop={cropPosition}
-                          zoom={cropZoom}
-                          aspect={
-                            cropFieldGeometry ? cropFieldGeometry.box.width / cropFieldGeometry.box.height : 1
+                          image={cropEditor.imageUrl}
+                          crop={cropEditor.crop}
+                          zoom={cropEditor.zoom}
+                          aspect={cropEditor.photoBox.width / cropEditor.photoBox.height}
+                          cropSize={
+                            cropAreaSize.width > 0 && cropAreaSize.height > 0
+                              ? { width: cropAreaSize.width, height: cropAreaSize.height }
+                              : undefined
                           }
-                          cropSize={{
-                            width: cropRectPx.width,
-                            height: cropRectPx.height
-                          }}
-                          onCropChange={setCropPosition}
-                          onZoomChange={setCropZoom}
+                          onCropChange={(nextCrop) =>
+                            setCropEditor((prev) => (prev ? { ...prev, crop: nextCrop } : prev))
+                          }
+                          onZoomChange={(nextZoom) =>
+                            setCropEditor((prev) => (prev ? { ...prev, zoom: Math.max(0.1, Math.min(8, nextZoom)) } : prev))
+                          }
                           onMediaLoaded={(media) => {
                             if (!media || !Number.isFinite(media.width) || !Number.isFinite(media.height)) return;
                             setCropMediaSize({
-                              width: Number.isFinite(media.naturalWidth ?? NaN) ? Number(media.naturalWidth) : media.width,
-                              height: Number.isFinite(media.naturalHeight ?? NaN) ? Number(media.naturalHeight) : media.height
+                              width: media.width,
+                              height: media.height
                             });
                           }}
                           onCropComplete={(_croppedArea: Area, croppedAreaPixels: Area) => {
-                            if (!cropMediaSize || cropMediaSize.width <= 0 || cropMediaSize.height <= 0) return;
-                            setCropNormDraft({
-                              x: clamp01(croppedAreaPixels.x / cropMediaSize.width),
-                              y: clamp01(croppedAreaPixels.y / cropMediaSize.height),
-                              w: clamp01(croppedAreaPixels.width / cropMediaSize.width),
-                              h: clamp01(croppedAreaPixels.height / cropMediaSize.height)
+                            setCropEditor((prev) => {
+                              if (!prev) return prev;
+                              return {
+                                ...prev,
+                                cropNorm: {
+                                  x: clamp01(croppedAreaPixels.x / prev.imageNaturalWidth),
+                                  y: clamp01(croppedAreaPixels.y / prev.imageNaturalHeight),
+                                  w: clamp01(croppedAreaPixels.width / prev.imageNaturalWidth),
+                                  h: clamp01(croppedAreaPixels.height / prev.imageNaturalHeight)
+                                }
+                              };
                             });
                           }}
                           objectFit="contain"
@@ -1344,73 +1233,70 @@ export default function TemplateEditorPage({
                           restrictPosition={false}
                           style={{
                             containerStyle: {
+                              width: "100%",
+                              height: "100%",
+                              position: "absolute",
+                              inset: "0",
                               overflow: "visible"
                             },
                             cropAreaStyle: {
-                              border: "0"
+                              width: "100%",
+                              height: "100%"
                             }
                           }}
                         />
-                        <div className="crop-handles-layer" aria-hidden="true">
-                          {handleDescriptors.map((handle) => (
-                            <button
-                              key={handle.key}
-                              type="button"
-                              className="crop-handle"
-                              data-handle={handle.key}
-                              style={{
-                                left: `${handle.x}px`,
-                                top: `${handle.y}px`,
-                                cursor: handle.cursor
-                              }}
-                              aria-label="Изменить масштаб"
-                              onPointerDown={startHandleZoom}
-                            />
-                          ))}
-                        </div>
                       </div>
-                    ) : (
-                      <div className="crop-loading-overlay">
-                        <span className="result-preview-spinner" />
-                        <span className="muted">Подготовка обрезки...</span>
+                      <div className="crop-handles-layer" aria-hidden="true">
+                        {resizeHandles.map((handle) => (
+                          <button
+                            key={handle.key}
+                            type="button"
+                            className="crop-handle"
+                            data-handle={handle.key}
+                            style={{
+                              left: `${handle.x}px`,
+                              top: `${handle.y}px`,
+                              cursor: handle.cursor
+                            }}
+                            onPointerDown={onResizeHandlePointerDown}
+                            aria-label="Изменить масштаб"
+                          />
+                        ))}
                       </div>
-                    )}
+                    </div>
                   </div>
                 </div>
               </div>
               <div className="row" style={{ marginTop: 12 }}>
-                <button type="button" onClick={() => confirmCrop()} disabled={!cropNormDraft}>
+                <button type="button" onClick={() => confirmCropEditor()} disabled={!cropEditor.cropNorm}>
                   Подтвердить
                 </button>
-                <button type="button" onClick={() => cancelCrop()}>
+                <button type="button" onClick={() => cancelCropEditor()}>
                   Отмена
                 </button>
               </div>
             </>
           ) : (
             <div className="result-preview-wrap" aria-busy={isGenerating || (Boolean(resultUrl) && !resultLoaded)}>
-              {resultUrl || previewUrl ? (
+              {showResultView ? (
                 <div className="result-preview-stack">
-                  {previewUrl && (!resultUrl || !resultLoaded) ? (
-                    <img src={previewUrl} alt="Preview template" className="result-preview-image" />
-                  ) : null}
-                  {resultUrl ? (
-                    <img
-                      src={resultUrl}
-                      alt="Готовый макет"
-                      className="result-preview-image"
-                      onLoad={() => setResultLoaded(true)}
-                      onError={() => {
-                        const friendly = asUiError("E_RESULT_LOAD_FAILED", "Не удалось загрузить созданный макет");
-                        setError(friendly);
-                        setStatus(friendly.message);
-                        setResultLoaded(false);
-                        setResultUrl(null);
-                      }}
-                      style={{ opacity: resultLoaded ? 1 : 0 }}
-                    />
-                  ) : null}
+                  <img
+                    src={resultUrl ?? ""}
+                    alt="Готовый макет"
+                    className="result-preview-image"
+                    onLoad={() => setResultLoaded(true)}
+                    onError={() => {
+                      const friendly = asUiError("E_RESULT_LOAD_FAILED", "Не удалось загрузить созданный макет");
+                      setError(friendly);
+                      setStatus(friendly.message);
+                      setResultLoaded(false);
+                      setResultUrl(null);
+                    }}
+                    style={{ opacity: resultLoaded ? 1 : 0 }}
+                  />
                 </div>
+              ) : previewUrl ? (
+                <img src={previewUrl} alt="Preview template" className="result-preview-image" />
               ) : (
                 <div className="result-preview-empty muted">Preview unavailable</div>
               )}
@@ -1489,6 +1375,7 @@ export default function TemplateEditorPage({
                       ...prev,
                       [activePhotoField]: {
                         source: "photobank",
+                    
                         path: item.path,
                         name: item.name,
                         previewUrl: item.previewUrl
@@ -1499,6 +1386,7 @@ export default function TemplateEditorPage({
                       delete next[activePhotoField];
                       return next;
                     });
+                    closeCropEditor();
                     setPhotobankOpen(false);
                   }}
                 >

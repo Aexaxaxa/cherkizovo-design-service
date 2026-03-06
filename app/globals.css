@@ -257,10 +257,6 @@ button:disabled {
   padding: 16px;
 }
 
-.crop-modal-card {
-  width: min(980px, 100%);
-}
-
 .crop-stage {
   position: relative;
   width: 100%;
@@ -268,13 +264,13 @@ button:disabled {
   margin: 0 auto;
   background: #111;
   border-radius: 12px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .crop-preview-wrap {
   position: relative;
   width: 100%;
-  min-height: 220px;
+  overflow: visible;
 }
 
 .crop-stage-preview {
@@ -283,25 +279,25 @@ button:disabled {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  display: block;
   opacity: 0.35;
-}
-
-.crop-stage-empty {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #fff;
+  pointer-events: none;
 }
 
 .crop-area-container {
   position: absolute;
-  border: 2px solid #ffffff;
   overflow: visible;
   touch-action: none;
-  z-index: 4;
+  box-sizing: border-box;
+}
+
+.cropper-host {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  margin: 0;
+  padding: 0;
 }
 
 .crop-area-container .reactEasyCrop_Container {
@@ -309,8 +305,11 @@ button:disabled {
   height: 100%;
 }
 
-.crop-area-container .reactEasyCrop_CropArea {
-  border: 0;
+.crop-handles-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
 }
 
 .crop-handle {
@@ -320,34 +319,20 @@ button:disabled {
   min-width: 14px;
   padding: 0;
   border-radius: 999px;
-  border: 2px solid #ffffff;
+  border: 2px solid #fff;
   background: #d7262d;
-  z-index: 5;
   transform: translate(-50%, -50%);
   pointer-events: auto;
-}
-
-.crop-handles-layer {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  z-index: 6;
-}
-
-.crop-outside-mask-part {
-  position: absolute;
-  background: rgba(0, 0, 0, 0.45);
-  pointer-events: none;
-  z-index: 3;
+  z-index: 5;
 }
 
 .crop-loading-overlay {
   position: absolute;
   inset: 0;
   display: flex;
-  gap: 10px;
   align-items: center;
   justify-content: center;
+  gap: 10px;
   background: rgba(255, 255, 255, 0.5);
   z-index: 7;
 }

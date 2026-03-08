@@ -10,6 +10,13 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent
 } from "react";
+import { RichColorTextField, type RichColorTextFieldHandle } from "./RichColorTextField";
+import {
+  getPlainTextFromSegments,
+  normalizeHexColor,
+  normalizeSegments,
+  type TextSegment
+} from "@/lib/richTextSegments";
 
 type SchemaField = {
   key: string;
@@ -35,6 +42,13 @@ type SchemaResponse = {
     };
     cornerRadii?: [number, number, number, number];
   }>;
+  textDefaults?: Record<
+    string,
+    {
+      defaultText?: string;
+      defaultColor?: string;
+    }
+  >;
   fields: SchemaField[];
 };
 
@@ -55,6 +69,9 @@ type UiError = {
 };
 
 type TextSizeAdjustValue = -1 | 0 | 1;
+
+const RICH_TEXT_FIELD_KEY = "text";
+const RICH_TEXT_COLORS = ["#CE0037", "#FFFFFF", "#000000"] as const;
 
 type PhotobankDirItem = {
   type: "dir";
@@ -203,7 +220,7 @@ function toGenerateError(payload: unknown): UiError {
   }
 
   if (parsed.code === "E_UPLOAD_TOO_LARGE") {
-    return asUiError("E_UPLOAD_TOO_LARGE", "Файл слишком большой. Максимум 15MB");
+    return asUiError("E_UPLOAD_TOO_LARGE", "Файл слишком большой. Максимум 30MB");
   }
 
   if (parsed.code === "E_UPLOAD_TYPE") {
@@ -273,6 +290,8 @@ export default function TemplateEditorPage({
     Array<{ name: string; nodeId: string; box: { x: number; y: number; width: number; height: number } }>
   >([]);
   const [fields, setFields] = useState<Record<string, string>>({});
+  const [richTextSegments, setRichTextSegments] = useState<Record<string, TextSegment[]>>({});
+  const [textDefaultColors, setTextDefaultColors] = useState<Record<string, string>>({});
   const [photoSelections, setPhotoSelections] = useState<Record<string, PhotoSelection | null>>({});
   const [textSizeAdjust, setTextSizeAdjust] = useState<Record<string, TextSizeAdjustValue>>({});
   const [status, setStatus] = useState("");
@@ -300,6 +319,7 @@ export default function TemplateEditorPage({
   const [cropMediaSize, setCropMediaSize] = useState<CropMediaSize | null>(null);
 
   const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const richTextFieldRef = useRef<RichColorTextFieldHandle | null>(null);
   const cropObjectUrlRef = useRef<string | null>(null);
   const cropPreviewWrapRef = useRef<HTMLDivElement | null>(null);
   const cropAreaRef = useRef<HTMLDivElement | null>(null);
@@ -317,6 +337,19 @@ export default function TemplateEditorPage({
 
   const textFields = useMemo(() => schemaFields.filter((field) => field.type === "text"), [schemaFields]);
   const imageFields = useMemo(() => schemaFields.filter((field) => field.type === "image"), [schemaFields]);
+  const richTextDefaultColor = useMemo(
+    () => normalizeHexColor(textDefaultColors[RICH_TEXT_FIELD_KEY], "#000000"),
+    [textDefaultColors]
+  );
+  const richTextFieldSegments = useMemo(() => {
+    const fromState = richTextSegments[RICH_TEXT_FIELD_KEY];
+    if (Array.isArray(fromState)) {
+      return normalizeSegments(fromState, richTextDefaultColor);
+    }
+    const fallbackText = fields[RICH_TEXT_FIELD_KEY] ?? "";
+    if (!fallbackText) return [];
+    return normalizeSegments([{ text: fallbackText, color: richTextDefaultColor }], richTextDefaultColor);
+  }, [fields, richTextDefaultColor, richTextSegments]);
   const photobankDirs = useMemo(
     () => photobankItems.filter((item): item is PhotobankDirItem => item.type === "dir"),
     [photobankItems]
@@ -419,6 +452,41 @@ export default function TemplateEditorPage({
               }))
           : []
       );
+
+      const hasRichTextField = payload.fields.some(
+        (field) => field.type === "text" && field.key === RICH_TEXT_FIELD_KEY
+      );
+      const textDefaultsRaw =
+        payload.textDefaults &&
+        typeof payload.textDefaults === "object" &&
+        !Array.isArray(payload.textDefaults)
+          ? payload.textDefaults
+          : {};
+
+      if (hasRichTextField) {
+        const richDefaults =
+          textDefaultsRaw[RICH_TEXT_FIELD_KEY] && typeof textDefaultsRaw[RICH_TEXT_FIELD_KEY] === "object"
+            ? textDefaultsRaw[RICH_TEXT_FIELD_KEY]
+            : {};
+        const defaultColor = normalizeHexColor(richDefaults.defaultColor, "#000000");
+        const defaultText = typeof richDefaults.defaultText === "string" ? richDefaults.defaultText : "";
+        const normalized = normalizeSegments([{ text: defaultText, color: defaultColor }], defaultColor);
+
+        setTextDefaultColors({
+          [RICH_TEXT_FIELD_KEY]: defaultColor
+        });
+        setRichTextSegments({
+          [RICH_TEXT_FIELD_KEY]: normalized
+        });
+        setFields((prev) => ({
+          ...prev,
+          [RICH_TEXT_FIELD_KEY]: defaultText
+        }));
+      } else {
+        setTextDefaultColors({});
+        setRichTextSegments({});
+      }
+
       await loadPreview(decodedId, payload.templateName || decodedId);
       setStatus("");
     } catch (err) {
@@ -437,6 +505,8 @@ export default function TemplateEditorPage({
     setStatus("");
     setError(null);
     setFields({});
+    setRichTextSegments({});
+    setTextDefaultColors({});
     setPhotoSelections({});
     setPhotoEdits({});
     setSchemaFrame(null);
@@ -454,6 +524,22 @@ export default function TemplateEditorPage({
   }, [loadSchema]);
 
   const canGenerate = useMemo(() => !loadingSchema && !isGenerating, [isGenerating, loadingSchema]);
+
+  const handleRichTextSegmentsChange = useCallback(
+    (nextSegments: TextSegment[]) => {
+      const normalized = normalizeSegments(nextSegments, richTextDefaultColor);
+      const plainText = getPlainTextFromSegments(normalized);
+      setRichTextSegments((prev) => ({
+        ...prev,
+        [RICH_TEXT_FIELD_KEY]: normalized
+      }));
+      setFields((prev) => ({
+        ...prev,
+        [RICH_TEXT_FIELD_KEY]: plainText
+      }));
+    },
+    [richTextDefaultColor]
+  );
 
   const loadPhotobank = useCallback(async (path: string, append = false, folderName?: string | null) => {
     if (append) {
@@ -724,10 +810,16 @@ export default function TemplateEditorPage({
       }
 
       const photoRefs: Record<string, PhotobankRef> = {};
+      const richTextPayload: Record<string, TextSegment[]> = {};
+      if (richTextFieldSegments.length > 0) {
+        richTextPayload[RICH_TEXT_FIELD_KEY] = normalizeSegments(richTextFieldSegments, richTextDefaultColor);
+      }
+
       const formData = new FormData();
       formData.append("templateId", decodedId);
       formData.append("fields", JSON.stringify(textPayload));
       formData.append("textSizeAdjust", JSON.stringify(textSizeAdjust));
+      formData.append("richText", JSON.stringify(richTextPayload));
 
       for (const imageField of imageFields) {
         const selection = photoSelections[imageField.key];
@@ -1051,17 +1143,45 @@ export default function TemplateEditorPage({
                 })}
               </div>
             </div>
-            <textarea
-              id={field.key}
-              rows={4}
-              value={fields[field.key] ?? ""}
-              onChange={(event) =>
-                setFields((prev) => ({
-                  ...prev,
-                  [field.key]: event.target.value
-                }))
-              }
-            />
+            {field.key === RICH_TEXT_FIELD_KEY ? (
+              <>
+                <RichColorTextField
+                  ref={richTextFieldRef}
+                  id={field.key}
+                  segments={richTextFieldSegments}
+                  defaultColor={richTextDefaultColor}
+                  disabled={isGenerating}
+                  onChangeSegments={handleRichTextSegmentsChange}
+                />
+                <div className="rich-text-color-picker" role="group" aria-label="Цвет выделенного текста">
+                  {RICH_TEXT_COLORS.map((color) => (
+                    <button
+                      key={color}
+                      type="button"
+                      className="rich-text-color-dot"
+                      style={{ backgroundColor: color }}
+                      aria-label={`Цвет ${color}`}
+                      onClick={() => {
+                        richTextFieldRef.current?.applyColorToSelection(color);
+                      }}
+                      disabled={isGenerating}
+                    />
+                  ))}
+                </div>
+              </>
+            ) : (
+              <textarea
+                id={field.key}
+                rows={4}
+                value={fields[field.key] ?? ""}
+                onChange={(event) =>
+                  setFields((prev) => ({
+                    ...prev,
+                    [field.key]: event.target.value
+                  }))
+                }
+              />
+            )}
           </div>
         ))}
 

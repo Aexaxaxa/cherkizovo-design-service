@@ -29,13 +29,33 @@ type SchemaPayload = {
     };
     cornerRadii?: [number, number, number, number];
   }>;
+  textDefaults?: Record<
+    string,
+    {
+      defaultText?: string;
+      defaultColor?: string;
+    }
+  >;
   fields: SchemaField[];
 };
 
 type FrameSnapshotNode = {
   id?: string;
   name?: string;
+  type?: string;
   visible?: boolean;
+  characters?: string;
+  fills?: Array<{
+    type?: string;
+    visible?: boolean;
+    opacity?: number;
+    color?: {
+      r?: number;
+      g?: number;
+      b?: number;
+      a?: number;
+    };
+  }>;
   cornerRadius?: number;
   rectangleCornerRadii?: number[];
   absoluteBoundingBox?: {
@@ -68,6 +88,50 @@ function normalizeRadii(node: FrameSnapshotNode): [number, number, number, numbe
     return [node.cornerRadius, node.cornerRadius, node.cornerRadius, node.cornerRadius];
   }
   return undefined;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function toHexChannel(value: number): string {
+  const normalized = value <= 1 ? value * 255 : value;
+  return clamp(Math.round(normalized), 0, 255).toString(16).padStart(2, "0").toUpperCase();
+}
+
+function toHexColor(node: FrameSnapshotNode): string {
+  const paints = Array.isArray(node.fills) ? node.fills : [];
+  for (const paint of paints) {
+    if (!paint || paint.type !== "SOLID" || paint.visible === false || !paint.color) continue;
+    if (!isFiniteNumber(paint.color.r) || !isFiniteNumber(paint.color.g) || !isFiniteNumber(paint.color.b)) continue;
+    return `#${toHexChannel(paint.color.r)}${toHexChannel(paint.color.g)}${toHexChannel(paint.color.b)}`;
+  }
+  return "#000000";
+}
+
+function extractTextDefaultsFromFrame(frameNode: FrameSnapshotNode): NonNullable<SchemaPayload["textDefaults"]> {
+  const defaults: NonNullable<SchemaPayload["textDefaults"]> = {};
+
+  function walk(node: FrameSnapshotNode) {
+    if (node.visible === false) return;
+
+    const name = typeof node.name === "string" ? node.name.trim() : "";
+    if (name === "text" && node.type === "TEXT" && !defaults.text) {
+      defaults.text = {
+        defaultText: typeof node.characters === "string" ? node.characters : "",
+        defaultColor: toHexColor(node)
+      };
+      return;
+    }
+
+    for (const child of node.children ?? []) {
+      if (defaults.text) return;
+      walk(child);
+    }
+  }
+
+  walk(frameNode);
+  return defaults;
 }
 
 function extractPhotoGeometryFromFrame(frameNode: FrameSnapshotNode): Pick<SchemaPayload, "frame" | "photoFields"> {
@@ -197,12 +261,21 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       }>(key);
       const frameSnapshot = await readSnapshotJson<FrameSnapshotNode>(getFrameSnapshotKey(fileKey, frameId));
       const geometry = extractPhotoGeometryFromFrame(frameSnapshot);
+      const textDefaults = extractTextDefaultsFromFrame(frameSnapshot);
+      const hasRichTextField = schemaSnapshot.fields.some((field) => field.type === "text" && field.key === "text");
+      if (hasRichTextField && !textDefaults.text) {
+        textDefaults.text = {
+          defaultText: "",
+          defaultColor: "#000000"
+        };
+      }
       const payload: SchemaPayload = {
         templateId: schemaSnapshot.templateId,
         templateName: schemaSnapshot.templateName,
         fields: schemaSnapshot.fields,
         frame: geometry.frame,
-        photoFields: geometry.photoFields
+        photoFields: geometry.photoFields,
+        textDefaults
       };
 
       set(cacheKey, payload, env.FIGMA_SCHEMA_TTL_SEC);

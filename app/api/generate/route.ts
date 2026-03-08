@@ -12,6 +12,7 @@ import { getFrameSnapshotKey, getSchemaSnapshotKey, readSnapshotJson, tryReadSna
 import { streamToBuffer } from "@/lib/streamToBuffer";
 import { getTemplateById, TPL_VK_POST_1_FIGMA, TPL_VK_POST_1_ID } from "@/lib/templates";
 import { renderUniversalTemplate, validateTextLineLimits, type TextSizeAdjustMap } from "@/lib/universalEngine";
+import { normalizeSegments, type TextSegment } from "@/lib/richTextSegments";
 import {
   buildSvgPathsForLines,
   getFontMetricsPx,
@@ -28,6 +29,7 @@ type GeneratePayload = {
   objectKey?: string;
   fields?: Record<string, string>;
   textSizeAdjust?: Record<string, unknown>;
+  richText?: Record<string, unknown>;
 };
 
 type SchemaField = {
@@ -84,6 +86,7 @@ type MultipartGenerateInput = {
   templateId: string;
   textFields: Record<string, string>;
   textSizeAdjust: TextSizeAdjustMap;
+  richText: Record<string, TextSegment[]>;
   photoRefs: Record<string, PhotobankRef>;
   photoEdits: Record<string, PhotoEdit>;
   files: Record<string, File>;
@@ -95,7 +98,7 @@ type PreparedPhoto = {
 };
 
 const SUPPORTED_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
-const MAX_FILE_BYTES = 15 * 1024 * 1024;
+const MAX_FILE_BYTES = 30 * 1024 * 1024;
 
 function parseTextSizeAdjust(raw: Record<string, unknown> | undefined): TextSizeAdjustMap {
   const out: TextSizeAdjustMap = {};
@@ -114,6 +117,21 @@ function parseTextSizeAdjust(raw: Record<string, unknown> | undefined): TextSize
     }
   }
 
+  return out;
+}
+
+function parseRichText(raw: unknown): Record<string, TextSegment[]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+
+  const out: Record<string, TextSegment[]> = {};
+  for (const [field, value] of Object.entries(raw)) {
+    if (!Array.isArray(value)) continue;
+    const normalized = normalizeSegments(value, "#000000");
+    if (normalized.length === 0) continue;
+    out[field] = normalized;
+  }
   return out;
 }
 
@@ -191,6 +209,13 @@ async function parseMultipartGenerateInput(request: Request): Promise<MultipartG
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       textSizeAdjust = parseTextSizeAdjust(parsed as Record<string, unknown>);
     }
+  }
+
+  let richText: Record<string, TextSegment[]> = {};
+  const rawRichText = formData.get("richText");
+  if (typeof rawRichText === "string" && rawRichText.trim()) {
+    const parsed = JSON.parse(rawRichText) as unknown;
+    richText = parseRichText(parsed);
   }
 
   let photoRefs: Record<string, PhotobankRef> = {};
@@ -278,6 +303,7 @@ async function parseMultipartGenerateInput(request: Request): Promise<MultipartG
     templateId,
     textFields,
     textSizeAdjust,
+    richText,
     photoRefs,
     photoEdits,
     files
@@ -799,6 +825,13 @@ export async function POST(request: Request) {
             ? payload.textSizeAdjust
             : undefined
         );
+    const richText = multipartInput?.richText
+      ? multipartInput.richText
+      : parseRichText(
+          payload?.richText && typeof payload.richText === "object" && !Array.isArray(payload.richText)
+            ? payload.richText
+            : undefined
+        );
 
     if (universalEnabled) {
       if (!templateId) {
@@ -892,7 +925,7 @@ export async function POST(request: Request) {
           } catch (error) {
             const code = error instanceof Error ? error.message : "E_GENERATE_FAILED";
             if (code === "E_UPLOAD_TOO_LARGE") {
-              return jsonError("E_UPLOAD_TOO_LARGE", "File is too large. Max 15MB", 400);
+              return jsonError("E_UPLOAD_TOO_LARGE", "File is too large. Max 30MB", 400);
             }
             if (code === "E_UPLOAD_TYPE") {
               return jsonError("E_UPLOAD_TYPE", "Unsupported image format. Allowed: JPEG, PNG, WEBP", 400);
@@ -912,6 +945,7 @@ export async function POST(request: Request) {
         templateId,
         fields: requestFields,
         textSizeAdjust,
+        richText,
         frameNode: frameNode as Parameters<typeof renderUniversalTemplate>[0]["frameNode"],
         includeDebug: debugRender
       });

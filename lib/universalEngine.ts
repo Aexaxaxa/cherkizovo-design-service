@@ -11,6 +11,12 @@ import {
 import { buildRoundedRectPath } from "@/lib/roundedRectPath";
 import { getBufferCached, getObjectBuffer } from "@/lib/s3";
 import { toSafeFrameId } from "@/lib/snapshotStore";
+import { wrapRichTextSegmentsByWords, type RichWrappedLine } from "@/lib/richTextLayout";
+import {
+  getPlainTextFromSegments,
+  normalizeSegments,
+  type TextSegment
+} from "@/lib/richTextSegments";
 import {
   buildSvgPathsForLines,
   getFontMetricsPx,
@@ -129,6 +135,7 @@ type MeasuredTextBlock = {
   node: LayoutNode;
   lines: string[];
   lineWidthsPx: number[];
+  richLines?: RichWrappedLine[];
   maxLineWidthPx: number;
   textBlockHeightPx: number;
   lineHeightPx: number;
@@ -140,6 +147,7 @@ type MeasuredTextBlock = {
   color: { r: number; g: number; b: number; a: number };
 };
 type LayoutBox = { x: number; y: number; width: number; height: number };
+type RichTextMap = Record<string, TextSegment[]>;
 
 export type TextSizeAdjust = -1 | 0 | 1;
 export type TextSizeAdjustMap = Record<string, TextSizeAdjust>;
@@ -332,6 +340,26 @@ function rgbaToCss(fill: { r: number; g: number; b: number; a: number }): string
   const b = Math.round(clamp(fill.b, 0, 1) * 255);
   const a = clamp(fill.a, 0, 1);
   return `rgba(${r},${g},${b},${a})`;
+}
+
+function hexColorToFill(
+  color: string,
+  fallback: { r: number; g: number; b: number; a: number }
+): { r: number; g: number; b: number; a: number } {
+  const normalized = color.trim().toUpperCase();
+  const match = /^#([0-9A-F]{6})$/.exec(normalized);
+  if (!match) return fallback;
+
+  const value = match[1];
+  const r = Number.parseInt(value.slice(0, 2), 16) / 255;
+  const g = Number.parseInt(value.slice(2, 4), 16) / 255;
+  const b = Number.parseInt(value.slice(4, 6), 16) / 255;
+  return {
+    r: Number.isFinite(r) ? r : fallback.r,
+    g: Number.isFinite(g) ? g : fallback.g,
+    b: Number.isFinite(b) ? b : fallback.b,
+    a: 1
+  };
 }
 
 function toRelativeBbox(node: LayoutNode, frameX: number, frameY: number) {
@@ -632,11 +660,25 @@ function getEditableTextValue(node: LayoutNode, fields: Record<string, string>, 
   return base;
 }
 
+function getRichTextSegmentsForNode(
+  node: LayoutNode,
+  richText: RichTextMap | undefined,
+  fieldsUsed: Set<string>
+): TextSegment[] | null {
+  if (node.name !== "text") return null;
+  const raw = richText?.[node.name];
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  fieldsUsed.add(node.name);
+  const normalized = normalizeSegments(raw, "#000000");
+  return normalized.length > 0 ? normalized : null;
+}
+
 async function measureTextBlock(
   node: LayoutNode,
   rawText: string,
   maxTextWidth: number,
-  adjust: TextSizeAdjust
+  adjust: TextSizeAdjust,
+  richSegments?: TextSegment[] | null
 ): Promise<MeasuredTextBlock> {
   const style = node.textStyle ?? {};
   const typography = resolveTypography(node, adjust);
@@ -646,6 +688,42 @@ async function measureTextBlock(
   const fontPath = resolveFontPath(style);
   const font = await loadFontCached(fontPath);
   const metrics = getFontMetricsPx(font, fontSize);
+  const primaryFill = getPrimaryFill(node) ?? { r: 0, g: 0, b: 0, a: 1 };
+
+  if (richSegments && richSegments.length > 0 && node.name === "text") {
+    const richLines = wrapRichTextSegmentsByWords({
+      segments: richSegments,
+      maxWidthPx: maxTextWidth,
+      font,
+      fontSizePx: fontSize,
+      letterSpacingPx: letterSpacing,
+      defaultColor: "#000000"
+    });
+    const safeRichLines = richLines.length > 0 ? richLines : [{ text: "", widthPx: 0, parts: [] }];
+    const safeLines = safeRichLines.map((line) => line.text);
+    const lineWidthsPx = safeRichLines.map((line) => line.widthPx);
+    const maxLineWidthPx = lineWidthsPx.reduce((maxWidth, lineWidth) => Math.max(maxWidth, lineWidth), 0);
+    const textAlignHorizontal =
+      style.textAlignHorizontal === "CENTER" || style.textAlignHorizontal === "RIGHT" ? style.textAlignHorizontal : "LEFT";
+    const textBlockHeightPx = (safeLines.length - 1) * lineHeightPx + (metrics.ascPx + metrics.descPx);
+
+    return {
+      node,
+      lines: safeLines,
+      lineWidthsPx,
+      richLines: safeRichLines,
+      maxLineWidthPx,
+      textBlockHeightPx,
+      lineHeightPx,
+      letterSpacing,
+      fontSize,
+      font,
+      metrics,
+      textAlignHorizontal,
+      color: primaryFill
+    };
+  }
+
   const lines = wrapTextByWords(rawText, maxTextWidth, font, fontSize, letterSpacing);
   const safeLines = lines.length > 0 ? lines : [""];
   const lineWidthsPx = safeLines.map((line) => measureTextPx(line, font, fontSize, letterSpacing));
@@ -665,7 +743,7 @@ async function measureTextBlock(
     font,
     metrics,
     textAlignHorizontal,
-    color: getPrimaryFill(node) ?? { r: 0, g: 0, b: 0, a: 1 }
+    color: primaryFill
   };
 }
 
@@ -700,6 +778,39 @@ function buildAlignedTextPaths(
     out += buildSvgPathsForLines(item.font, [line], lineStartX, baselineY, item.fontSize, item.lineHeightPx);
   }
   return out;
+}
+
+function buildAlignedTextSvg(
+  item: MeasuredTextBlock,
+  innerLeft: number,
+  innerWidth: number,
+  firstBaselineY: number
+): string {
+  if (item.richLines && item.richLines.length > 0) {
+    let out = "";
+    for (let lineIndex = 0; lineIndex < item.richLines.length; lineIndex += 1) {
+      const line = item.richLines[lineIndex];
+      const baselineY = firstBaselineY + lineIndex * item.lineHeightPx;
+      const lineWidth = line.widthPx;
+      const lineStartX = getAlignedLineStartX(item.textAlignHorizontal, innerLeft, innerWidth, lineWidth);
+      if (!line.parts || line.parts.length === 0) continue;
+
+      let prefix = "";
+      for (const part of line.parts) {
+        if (!part.text) continue;
+        const partX = lineStartX + measureTextPx(prefix, item.font, item.fontSize, item.letterSpacing);
+        const paths = buildSvgPathsForLines(item.font, [part.text], partX, baselineY, item.fontSize, item.lineHeightPx);
+        if (!paths) continue;
+        out += `<g fill="${rgbaToCss(hexColorToFill(part.color, item.color))}">${paths}</g>`;
+        prefix += part.text;
+      }
+    }
+    return out;
+  }
+
+  const paths = buildAlignedTextPaths(item, innerLeft, innerWidth, firstBaselineY);
+  if (!paths) return "";
+  return `<g fill="${rgbaToCss(item.color)}">${paths}</g>`;
 }
 
 function normalizeAxisAlign(value: string | undefined): "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN" {
@@ -745,6 +856,7 @@ async function renderEditableText(
   nodes: LayoutNode[],
   treeById: Map<string, LayoutNode>,
   fields: Record<string, string>,
+  richText: RichTextMap | undefined,
   textSizeAdjust: TextSizeAdjustMap,
   templateName: string | undefined,
   frameX: number,
@@ -789,7 +901,14 @@ async function renderEditableText(
   const constraintH = (container?.constraints?.horizontal ?? node.constraints?.horizontal ?? "LEFT") as string;
   const constraintV = (container?.constraints?.vertical ?? node.constraints?.vertical ?? "TOP") as string;
 
-  const rawTexts = nodes.map((textNode) => getEditableTextValue(textNode, fields, fieldsUsed));
+  const richSegmentsByNode = nodes.map((textNode) => getRichTextSegmentsForNode(textNode, richText, fieldsUsed));
+  const rawTexts = nodes.map((textNode, index) => {
+    const richSegments = richSegmentsByNode[index];
+    if (richSegments) {
+      return getPlainTextFromSegments(richSegments);
+    }
+    return getEditableTextValue(textNode, fields, fieldsUsed);
+  });
   const nodeWrapWidths = nodes.map((textNode) => {
     const childBox = computedBoxes?.get(textNode.id);
     return childBox ? Math.max(1, childBox.width) : undefined;
@@ -846,7 +965,7 @@ async function renderEditableText(
     nodes.map((textNode, index) => {
       const wrapW = resolveWrapWidthForNode(index, initialInnerW);
       const adjust = normalizeTextSizeAdjust(textSizeAdjust[textNode.name]);
-      return measureTextBlock(textNode, rawTexts[index], wrapW, adjust);
+      return measureTextBlock(textNode, rawTexts[index], wrapW, adjust, richSegmentsByNode[index]);
     })
   );
   const measuredTextW_A = measuredA.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
@@ -862,7 +981,7 @@ async function renderEditableText(
     nodes.map((textNode, index) => {
       const wrapW = resolveWrapWidthForNode(index, finalInnerW);
       const adjust = normalizeTextSizeAdjust(textSizeAdjust[textNode.name]);
-      return measureTextBlock(textNode, rawTexts[index], wrapW, adjust);
+      return measureTextBlock(textNode, rawTexts[index], wrapW, adjust, richSegmentsByNode[index]);
     })
   );
   const measuredTextW_B = measuredB.reduce((maxWidth, item) => Math.max(maxWidth, item.maxLineWidthPx), 0);
@@ -1007,8 +1126,7 @@ async function renderEditableText(
         ? innerTop + alignOffset(counterAlign, innerHeight, itemH)
         : cursorY;
       const baselineY = itemTop + item.metrics.ascPx;
-      const paths = buildAlignedTextPaths(item, itemLeft, itemInnerWidth, baselineY);
-      textPaths += `<g fill="${rgbaToCss(item.color)}">${paths}</g>`;
+      textPaths += buildAlignedTextSvg(item, itemLeft, itemInnerWidth, baselineY);
       if (isHorizontalLayout) {
         cursorX += itemInnerWidth + itemSpacing;
       } else {
@@ -1021,8 +1139,7 @@ async function renderEditableText(
     const baselineY = textTopY + item.metrics.ascPx;
     const itemInnerWidth = Math.max(1, Math.min(innerWidth, item.maxLineWidthPx));
     const itemLeft = innerLeft + alignOffset(counterAlign, innerWidth, itemInnerWidth);
-    const paths = buildAlignedTextPaths(item, itemLeft, itemInnerWidth, baselineY);
-    textPaths = `<g fill="${rgbaToCss(item.color)}">${paths}</g>`;
+    textPaths = buildAlignedTextSvg(item, itemLeft, itemInnerWidth, baselineY);
   }
 
   const width = ensureLayerGeometry(blockW, 1);
@@ -1374,6 +1491,7 @@ type RenderTreeContext = {
   frameW: number;
   frameH: number;
   fields: Record<string, string>;
+  richText?: RichTextMap;
   fieldsUsed: Set<string>;
   treeById: Map<string, LayoutNode>;
   containerTextMap: Map<string, LayoutNode[]>;
@@ -1622,6 +1740,7 @@ async function renderNodeTree(
       [node],
       context.treeById,
       context.fields,
+      context.richText,
       context.textSizeAdjust,
       context.templateName,
       context.frameX,
@@ -1648,6 +1767,7 @@ async function renderNodeTree(
       mappedTextNodes,
       context.treeById,
       context.fields,
+      context.richText,
       context.textSizeAdjust,
       context.templateName,
       context.frameX,
@@ -1799,6 +1919,7 @@ async function renderNodeTree(
 export async function renderUniversalTemplate(input: {
   templateId: string;
   fields: Record<string, string>;
+  richText?: RichTextMap;
   textSizeAdjust?: TextSizeAdjustMap;
   frameNode: FigmaNodeLite;
   refresh?: boolean;
@@ -1862,6 +1983,7 @@ export async function renderUniversalTemplate(input: {
     frameW,
     frameH,
     fields: input.fields,
+    richText: input.richText,
     fieldsUsed,
     treeById: tree.byId,
     containerTextMap,

@@ -5,7 +5,7 @@ import { putObject } from "@/lib/s3";
 export const runtime = "nodejs";
 
 const SUPPORTED_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
-const MAX_FILE_BYTES = 15 * 1024 * 1024;
+const MAX_FILE_BYTES = 30 * 1024 * 1024;
 
 function extFromMime(mimeType: string): string {
   switch (mimeType) {
@@ -44,7 +44,7 @@ export async function POST(request: Request) {
       }
 
       if (value.size > MAX_FILE_BYTES) {
-        return errorJson("E_UPLOAD_TOO_LARGE", `Файл ${fieldName} превышает 15MB`, 400);
+        return errorJson("E_UPLOAD_TOO_LARGE", `Файл ${fieldName} превышает 30MB`, 400);
       }
 
       const body = Buffer.from(await value.arrayBuffer());

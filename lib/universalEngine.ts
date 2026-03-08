@@ -670,7 +670,7 @@ function getRichTextSegmentsForNode(
   if (!Array.isArray(raw) || raw.length === 0) return null;
   fieldsUsed.add(node.name);
   const normalized = normalizeSegments(raw, "#000000");
-  return normalized.length > 0 ? normalized : null;
+  return getPlainTextFromSegments(normalized).length > 0 ? normalized : null;
 }
 
 async function measureTextBlock(

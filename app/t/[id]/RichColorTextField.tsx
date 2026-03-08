@@ -1,20 +1,23 @@
 "use client";
 
 import {
+  useEffect,
   forwardRef,
   useCallback,
   useImperativeHandle,
   useLayoutEffect,
   useMemo,
-  useRef
+  useRef,
+  useState
 } from "react";
 import {
   applyColorToRange,
+  getColorForInsertion,
   getPlainTextFromSegments,
   normalizeHexColor,
   normalizeSegments,
-  reconcileSegmentsWithPlainText,
-  replaceTextRangeInSegments,
+  reconcileSegmentsWithPlainTextAndColor,
+  replaceTextRangeInSegmentsWithColor,
   type TextSegment
 } from "@/lib/richTextSegments";
 
@@ -34,6 +37,43 @@ type RichColorTextFieldProps = {
   disabled?: boolean;
   onChangeSegments: (next: TextSegment[]) => void;
 };
+
+function ensureEditorSegments(input: unknown, fallbackColor: string, emptyColor: string): TextSegment[] {
+  const normalized = normalizeSegments(input, fallbackColor);
+  if (getPlainTextFromSegments(normalized).length > 0) {
+    return normalized;
+  }
+  return [{ text: "", color: normalizeHexColor(emptyColor, fallbackColor) }];
+}
+
+function getPreferredEmptyColor(segments: TextSegment[], fallbackColor: string): string {
+  const first = Array.isArray(segments) ? segments[0] : null;
+  return normalizeHexColor(first?.color, fallbackColor);
+}
+
+function buildFragmentFromSegments(doc: Document, segments: TextSegment[]): DocumentFragment {
+  const fragment = doc.createDocumentFragment();
+  for (const segment of segments) {
+    const span = doc.createElement("span");
+    span.dataset.segmentColor = segment.color;
+    span.style.color = segment.color;
+    span.textContent = segment.text;
+    fragment.appendChild(span);
+  }
+  return fragment;
+}
+
+function domMatchesSegments(root: HTMLElement, segments: TextSegment[]): boolean {
+  if (root.childNodes.length !== segments.length) return false;
+  for (let index = 0; index < segments.length; index += 1) {
+    const node = root.childNodes[index];
+    if (!(node instanceof HTMLSpanElement)) return false;
+    const expected = segments[index];
+    if ((node.textContent ?? "") !== expected.text) return false;
+    if ((node.dataset.segmentColor ?? "").toUpperCase() !== expected.color.toUpperCase()) return false;
+  }
+  return true;
+}
 
 function getSelectionRange(root: HTMLElement): SelectionRange | null {
   const selection = window.getSelection();
@@ -113,18 +153,41 @@ export const RichColorTextField = forwardRef<RichColorTextFieldHandle, RichColor
 ) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const pendingSelectionRef = useRef<SelectionRange | null>(null);
+  const segmentsRef = useRef<TextSegment[]>([]);
   const safeDefaultColor = useMemo(() => normalizeHexColor(defaultColor, "#000000"), [defaultColor]);
+  const [insertionColor, setInsertionColor] = useState(safeDefaultColor);
+  const insertionColorRef = useRef(safeDefaultColor);
   const normalizedSegments = useMemo(
-    () => normalizeSegments(segments, safeDefaultColor),
+    () => ensureEditorSegments(segments, safeDefaultColor, getPreferredEmptyColor(segments, safeDefaultColor)),
     [segments, safeDefaultColor]
   );
 
+  const setActiveInsertionColor = useCallback(
+    (rawColor: string) => {
+      const safeColor = normalizeHexColor(rawColor, safeDefaultColor);
+      insertionColorRef.current = safeColor;
+      setInsertionColor((prev) => (prev === safeColor ? prev : safeColor));
+    },
+    [safeDefaultColor]
+  );
+
+  useEffect(() => {
+    const plainText = getPlainTextFromSegments(normalizedSegments);
+    if (plainText.length === 0) {
+      setActiveInsertionColor(normalizedSegments[0]?.color ?? safeDefaultColor);
+    }
+    segmentsRef.current = normalizedSegments;
+  }, [normalizedSegments, safeDefaultColor, setActiveInsertionColor]);
+
   const commitSegments = useCallback(
-    (next: TextSegment[], nextSelection?: SelectionRange | null) => {
-      if (nextSelection) {
-        pendingSelectionRef.current = nextSelection;
+    (next: TextSegment[], options?: { selection?: SelectionRange | null; emptyColor?: string | null }) => {
+      if (options && "selection" in options) {
+        pendingSelectionRef.current = options.selection ?? null;
       }
-      onChangeSegments(normalizeSegments(next, safeDefaultColor));
+      const safeEmptyColor = normalizeHexColor(options?.emptyColor ?? insertionColorRef.current, safeDefaultColor);
+      const normalized = ensureEditorSegments(next, safeDefaultColor, safeEmptyColor);
+      segmentsRef.current = normalized;
+      onChangeSegments(normalized);
     },
     [onChangeSegments, safeDefaultColor]
   );
@@ -133,21 +196,32 @@ export const RichColorTextField = forwardRef<RichColorTextFieldHandle, RichColor
     (color: string): boolean => {
       const root = rootRef.current;
       if (!root || disabled) return false;
+      const safeColor = normalizeHexColor(color, safeDefaultColor);
       const selectionRange = getSelectionRange(root);
-      if (!selectionRange || selectionRange.start === selectionRange.end) return false;
+      const currentSegments = segmentsRef.current;
+      const plainText = getPlainTextFromSegments(currentSegments);
+      setActiveInsertionColor(safeColor);
 
-      const next = applyColorToRange(
-        normalizedSegments,
-        selectionRange.start,
-        selectionRange.end,
-        color,
-        safeDefaultColor
-      );
-      commitSegments(next, selectionRange);
+      if (selectionRange && selectionRange.start !== selectionRange.end) {
+        const next = applyColorToRange(
+          currentSegments,
+          selectionRange.start,
+          selectionRange.end,
+          safeColor,
+          safeDefaultColor
+        );
+        commitSegments(next, { selection: selectionRange, emptyColor: safeColor });
+      } else if (plainText.length === 0) {
+        commitSegments([{ text: "", color: safeColor }], {
+          selection: { start: 0, end: 0 },
+          emptyColor: safeColor
+        });
+      }
+
       root.focus();
       return true;
     },
-    [commitSegments, disabled, normalizedSegments, safeDefaultColor]
+    [commitSegments, disabled, safeDefaultColor, setActiveInsertionColor]
   );
 
   useImperativeHandle(
@@ -162,34 +236,71 @@ export const RichColorTextField = forwardRef<RichColorTextFieldHandle, RichColor
     (insertedText: string) => {
       const root = rootRef.current;
       if (!root || disabled) return;
-      const currentText = getPlainTextFromSegments(normalizedSegments);
+      const currentSegments = segmentsRef.current;
+      const currentText = getPlainTextFromSegments(currentSegments);
       const selectionRange =
         getSelectionRange(root) ??
         ({
           start: currentText.length,
           end: currentText.length
         } satisfies SelectionRange);
-      const next = replaceTextRangeInSegments(
-        normalizedSegments,
+      const activeColor = insertionColorRef.current;
+      const next = replaceTextRangeInSegmentsWithColor(
+        currentSegments,
         selectionRange.start,
         selectionRange.end,
         insertedText,
+        activeColor,
         safeDefaultColor
       );
       const cursor = selectionRange.start + insertedText.length;
-      commitSegments(next, { start: cursor, end: cursor });
+      commitSegments(next, {
+        selection: { start: cursor, end: cursor },
+        emptyColor: activeColor
+      });
     },
-    [commitSegments, disabled, normalizedSegments, safeDefaultColor]
+    [commitSegments, disabled, safeDefaultColor]
   );
 
   const handleInput = useCallback(() => {
     const root = rootRef.current;
     if (!root || disabled) return;
+    const currentSegments = segmentsRef.current;
+    const activeColor = insertionColorRef.current;
     const nextPlainText = root.textContent ?? "";
-    const next = reconcileSegmentsWithPlainText(normalizedSegments, nextPlainText, safeDefaultColor);
+    const next = reconcileSegmentsWithPlainTextAndColor(currentSegments, nextPlainText, activeColor, safeDefaultColor);
     const selectionRange = getSelectionRange(root);
-    commitSegments(next, selectionRange);
-  }, [commitSegments, disabled, normalizedSegments, safeDefaultColor]);
+    commitSegments(next, {
+      selection: selectionRange,
+      emptyColor: activeColor
+    });
+
+    if (selectionRange && selectionRange.start === selectionRange.end) {
+      const caretColor = getColorForInsertion(next, selectionRange.start, safeDefaultColor);
+      setActiveInsertionColor(caretColor);
+    } else if (getPlainTextFromSegments(next).length === 0) {
+      setActiveInsertionColor(next[0]?.color ?? activeColor);
+    }
+  }, [commitSegments, disabled, safeDefaultColor, setActiveInsertionColor]);
+
+  const handleBlur = useCallback(() => {
+    const root = rootRef.current;
+    if (!root || disabled) return;
+    const currentSegments = segmentsRef.current;
+    const activeColor = insertionColorRef.current;
+    const nextPlainText = root.textContent ?? "";
+    const next = reconcileSegmentsWithPlainTextAndColor(currentSegments, nextPlainText, activeColor, safeDefaultColor);
+    commitSegments(next, { selection: null, emptyColor: activeColor });
+  }, [commitSegments, disabled, safeDefaultColor]);
+
+  const syncInsertionColorFromCaret = useCallback(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const selectionRange = getSelectionRange(root);
+    if (!selectionRange || selectionRange.start !== selectionRange.end) return;
+    const caretColor = getColorForInsertion(segmentsRef.current, selectionRange.start, safeDefaultColor);
+    setActiveInsertionColor(caretColor);
+  }, [safeDefaultColor, setActiveInsertionColor]);
 
   const handlePaste = useCallback(
     (event: React.ClipboardEvent<HTMLDivElement>) => {
@@ -212,10 +323,18 @@ export const RichColorTextField = forwardRef<RichColorTextFieldHandle, RichColor
   useLayoutEffect(() => {
     const root = rootRef.current;
     if (!root) return;
-    const pending = pendingSelectionRef.current;
-    if (!pending) return;
+    const modelSegments = normalizedSegments;
+    const modelText = getPlainTextFromSegments(modelSegments);
+    const pendingSelection = pendingSelectionRef.current ?? getSelectionRange(root);
+    const requiresSync = (root.textContent ?? "") !== modelText || !domMatchesSegments(root, modelSegments);
+
+    if (requiresSync) {
+      root.replaceChildren(buildFragmentFromSegments(document, modelSegments));
+    }
+    if (pendingSelection) {
+      restoreSelectionRange(root, pendingSelection);
+    }
     pendingSelectionRef.current = null;
-    restoreSelectionRange(root, pending);
   }, [normalizedSegments]);
 
   return (
@@ -229,14 +348,13 @@ export const RichColorTextField = forwardRef<RichColorTextFieldHandle, RichColor
       suppressContentEditableWarning
       spellCheck={false}
       onInput={handleInput}
+      onBlur={handleBlur}
       onPaste={handlePaste}
       onKeyDown={handleKeyDown}
-    >
-      {normalizedSegments.map((segment, index) => (
-        <span key={`${index}:${segment.color}:${segment.text.length}`} style={{ color: segment.color }}>
-          {segment.text}
-        </span>
-      ))}
-    </div>
+      onMouseUp={syncInsertionColorFromCaret}
+      onKeyUp={syncInsertionColorFromCaret}
+      onFocus={syncInsertionColorFromCaret}
+      data-insertion-color={insertionColor}
+    />
   );
 });

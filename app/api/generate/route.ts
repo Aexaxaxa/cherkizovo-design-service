@@ -12,7 +12,7 @@ import { getFrameSnapshotKey, getSchemaSnapshotKey, readSnapshotJson, tryReadSna
 import { streamToBuffer } from "@/lib/streamToBuffer";
 import { getTemplateById, TPL_VK_POST_1_FIGMA, TPL_VK_POST_1_ID } from "@/lib/templates";
 import { renderUniversalTemplate, validateTextLineLimits, type TextSizeAdjustMap } from "@/lib/universalEngine";
-import { normalizeSegments, type TextSegment } from "@/lib/richTextSegments";
+import { getPlainTextFromSegments, normalizeSegments, type TextSegment } from "@/lib/richTextSegments";
 import {
   buildSvgPathsForLines,
   getFontMetricsPx,
@@ -129,7 +129,7 @@ function parseRichText(raw: unknown): Record<string, TextSegment[]> {
   for (const [field, value] of Object.entries(raw)) {
     if (!Array.isArray(value)) continue;
     const normalized = normalizeSegments(value, "#000000");
-    if (normalized.length === 0) continue;
+    if (getPlainTextFromSegments(normalized).length === 0) continue;
     out[field] = normalized;
   }
   return out;

@@ -344,10 +344,14 @@ export default function TemplateEditorPage({
   const richTextFieldSegments = useMemo(() => {
     const fromState = richTextSegments[RICH_TEXT_FIELD_KEY];
     if (Array.isArray(fromState)) {
-      return normalizeSegments(fromState, richTextDefaultColor);
+      const normalized = normalizeSegments(fromState, richTextDefaultColor);
+      if (getPlainTextFromSegments(normalized).length > 0) {
+        return normalized;
+      }
+      return [{ text: "", color: normalizeHexColor(fromState[0]?.color, richTextDefaultColor) }];
     }
     const fallbackText = fields[RICH_TEXT_FIELD_KEY] ?? "";
-    if (!fallbackText) return [];
+    if (!fallbackText) return [{ text: "", color: richTextDefaultColor }];
     return normalizeSegments([{ text: fallbackText, color: richTextDefaultColor }], richTextDefaultColor);
   }, [fields, richTextDefaultColor, richTextSegments]);
   const photobankDirs = useMemo(
@@ -529,9 +533,13 @@ export default function TemplateEditorPage({
     (nextSegments: TextSegment[]) => {
       const normalized = normalizeSegments(nextSegments, richTextDefaultColor);
       const plainText = getPlainTextFromSegments(normalized);
+      const normalizedForState =
+        plainText.length > 0
+          ? normalized
+          : [{ text: "", color: normalizeHexColor(nextSegments[0]?.color, richTextDefaultColor) }];
       setRichTextSegments((prev) => ({
         ...prev,
-        [RICH_TEXT_FIELD_KEY]: normalized
+        [RICH_TEXT_FIELD_KEY]: normalizedForState
       }));
       setFields((prev) => ({
         ...prev,
@@ -811,7 +819,7 @@ export default function TemplateEditorPage({
 
       const photoRefs: Record<string, PhotobankRef> = {};
       const richTextPayload: Record<string, TextSegment[]> = {};
-      if (richTextFieldSegments.length > 0) {
+      if (getPlainTextFromSegments(richTextFieldSegments).length > 0) {
         richTextPayload[RICH_TEXT_FIELD_KEY] = normalizeSegments(richTextFieldSegments, richTextDefaultColor);
       }
 

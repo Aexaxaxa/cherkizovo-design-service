@@ -10,6 +10,13 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+function createEmptySegment(fallbackColor: string): TextSegment {
+  return {
+    text: "",
+    color: normalizeHexColor(fallbackColor, "#000000")
+  };
+}
+
 export function normalizeHexColor(input: unknown, fallback = "#000000"): string {
   const fallbackSafe = typeof fallback === "string" ? fallback : "#000000";
   const source = typeof input === "string" ? input.trim() : "";
@@ -45,16 +52,17 @@ export function normalizeHexColor(input: unknown, fallback = "#000000"): string 
 }
 
 export function normalizeSegments(input: unknown, fallbackColor = "#000000"): TextSegment[] {
-  if (!Array.isArray(input)) return [];
+  const safeFallbackColor = normalizeHexColor(fallbackColor, "#000000");
+  if (!Array.isArray(input)) return [createEmptySegment(safeFallbackColor)];
 
   const out: TextSegment[] = [];
   for (const raw of input) {
     if (!raw || typeof raw !== "object") continue;
     const textRaw = "text" in raw ? raw.text : "";
-    const colorRaw = "color" in raw ? raw.color : fallbackColor;
+    const colorRaw = "color" in raw ? raw.color : safeFallbackColor;
     const text = typeof textRaw === "string" ? textRaw : "";
     if (!text) continue;
-    const color = normalizeHexColor(colorRaw, fallbackColor);
+    const color = normalizeHexColor(colorRaw, safeFallbackColor);
     const prev = out[out.length - 1];
     if (prev && prev.color === color) {
       prev.text += text;
@@ -63,7 +71,7 @@ export function normalizeSegments(input: unknown, fallbackColor = "#000000"): Te
     }
   }
 
-  return out;
+  return out.length > 0 ? out : [createEmptySegment(safeFallbackColor)];
 }
 
 export function getPlainTextFromSegments(segments: TextSegment[]): string {
@@ -166,9 +174,23 @@ export function replaceTextRangeInSegments(
   fallbackColor = "#000000"
 ): TextSegment[] {
   const normalized = normalizeSegments(segments, fallbackColor);
+  const insertionColor = getColorForInsertion(normalized, start, fallbackColor);
+  return replaceTextRangeInSegmentsWithColor(normalized, start, end, insertedText, insertionColor, fallbackColor);
+}
+
+export function replaceTextRangeInSegmentsWithColor(
+  segments: TextSegment[],
+  start: number,
+  end: number,
+  insertedText: string,
+  insertionColor: string,
+  fallbackColor = "#000000"
+): TextSegment[] {
+  const normalized = normalizeSegments(segments, fallbackColor);
   const total = getPlainTextFromSegments(normalized).length;
   const range = clampRange(start, end, total);
   const safeInserted = typeof insertedText === "string" ? insertedText : "";
+  const safeInsertionColor = normalizeHexColor(insertionColor, fallbackColor);
 
   const before = sliceSegmentsByRange(normalized, 0, range.start, fallbackColor);
   const after = sliceSegmentsByRange(normalized, range.end, total, fallbackColor);
@@ -176,25 +198,15 @@ export function replaceTextRangeInSegments(
   if (safeInserted.length > 0) {
     inserted.push({
       text: safeInserted,
-      color: getColorForInsertion(normalized, range.start, fallbackColor)
+      color: safeInsertionColor
     });
   }
 
   return normalizeSegments([...before, ...inserted, ...after], fallbackColor);
 }
 
-export function reconcileSegmentsWithPlainText(
-  previousSegments: TextSegment[],
-  nextPlainText: string,
-  fallbackColor = "#000000"
-): TextSegment[] {
-  const normalized = normalizeSegments(previousSegments, fallbackColor);
-  const previousText = getPlainTextFromSegments(normalized);
-  const nextText = typeof nextPlainText === "string" ? nextPlainText : "";
-  if (previousText === nextText) {
-    return normalized;
-  }
-
+function findTextDiff(previousText: string, nextText: string): { oldStart: number; oldEnd: number; inserted: string } | null {
+  if (previousText === nextText) return null;
   const maxPrefix = Math.min(previousText.length, nextText.length);
   let prefix = 0;
   while (prefix < maxPrefix && previousText[prefix] === nextText[prefix]) {
@@ -214,7 +226,57 @@ export function reconcileSegmentsWithPlainText(
   const oldEnd = previousText.length - suffix;
   const newStart = prefix;
   const newEnd = nextText.length - suffix;
-  const inserted = nextText.slice(newStart, newEnd);
+  return {
+    oldStart,
+    oldEnd,
+    inserted: nextText.slice(newStart, newEnd)
+  };
+}
 
-  return replaceTextRangeInSegments(normalized, oldStart, oldEnd, inserted, fallbackColor);
+export function reconcileSegmentsWithPlainText(
+  previousSegments: TextSegment[],
+  nextPlainText: string,
+  fallbackColor = "#000000"
+): TextSegment[] {
+  const normalized = normalizeSegments(previousSegments, fallbackColor);
+  const previousText = getPlainTextFromSegments(normalized);
+  const nextText = typeof nextPlainText === "string" ? nextPlainText : "";
+  const diff = findTextDiff(previousText, nextText);
+  if (!diff) {
+    return normalized;
+  }
+
+  const insertionColor = getColorForInsertion(normalized, diff.oldStart, fallbackColor);
+  return replaceTextRangeInSegmentsWithColor(
+    normalized,
+    diff.oldStart,
+    diff.oldEnd,
+    diff.inserted,
+    insertionColor,
+    fallbackColor
+  );
+}
+
+export function reconcileSegmentsWithPlainTextAndColor(
+  previousSegments: TextSegment[],
+  nextPlainText: string,
+  insertionColor: string,
+  fallbackColor = "#000000"
+): TextSegment[] {
+  const normalized = normalizeSegments(previousSegments, fallbackColor);
+  const previousText = getPlainTextFromSegments(normalized);
+  const nextText = typeof nextPlainText === "string" ? nextPlainText : "";
+  const diff = findTextDiff(previousText, nextText);
+  if (!diff) {
+    return normalized;
+  }
+
+  return replaceTextRangeInSegmentsWithColor(
+    normalized,
+    diff.oldStart,
+    diff.oldEnd,
+    diff.inserted,
+    insertionColor,
+    fallbackColor
+  );
 }

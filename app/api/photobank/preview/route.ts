@@ -12,7 +12,7 @@ export async function GET(request: Request) {
     if (!path) {
       return NextResponse.json(
         {
-          code: "E_PHOTOBANK_BROWSE",
+          code: "E_PHOTOBANK_PREVIEW_FAILED",
           error: "path is required"
         },
         { status: 400 }
@@ -20,15 +20,39 @@ export async function GET(request: Request) {
     }
 
     const previewUrl = await resolvePhotobankPreviewUrl(path, size);
-    return NextResponse.json({ previewUrl });
+    const previewResponse = await fetch(previewUrl, { cache: "no-store" });
+    if (!previewResponse.ok) {
+      throw new Error(`Yandex preview download failed: ${previewResponse.status}`);
+    }
+
+    const upstreamType = previewResponse.headers.get("content-type")?.split(";")[0]?.trim();
+    const contentType =
+      upstreamType && upstreamType.startsWith("image/")
+        ? upstreamType
+        : path.toLowerCase().endsWith(".png")
+          ? "image/png"
+          : path.toLowerCase().endsWith(".webp")
+            ? "image/webp"
+            : path.toLowerCase().endsWith(".gif")
+              ? "image/gif"
+              : "image/jpeg";
+
+    const imageData = await previewResponse.arrayBuffer();
+
+    return new Response(imageData, {
+      status: 200,
+      headers: {
+        "Content-Type": contentType,
+        "Cache-Control": "public, max-age=300"
+      }
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to resolve photobank preview";
     return NextResponse.json(
       {
-        code: "E_PHOTOBANK_BROWSE",
-        error: message
+        code: "E_PHOTOBANK_PREVIEW_FAILED",
+        error: "Photobank preview failed"
       },
-      { status: 500 }
+      { status: 502 }
     );
   }
 }

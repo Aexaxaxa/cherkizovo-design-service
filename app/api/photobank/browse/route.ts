@@ -3,6 +3,12 @@ import { browsePhotobank } from "@/lib/photobank";
 
 export const runtime = "nodejs";
 
+function buildPreviewProxyUrl(path: string): string {
+  const params = new URLSearchParams();
+  params.set("path", path);
+  return `/api/photobank/preview?${params.toString()}`;
+}
+
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
@@ -16,7 +22,17 @@ export async function GET(request: Request) {
       offset: offset ? Number(offset) : undefined
     });
 
-    return NextResponse.json(result);
+    return NextResponse.json({
+      ...result,
+      items: result.items.map((item) =>
+        item.type === "file"
+          ? {
+              ...item,
+              previewUrl: buildPreviewProxyUrl(item.path)
+            }
+          : item
+      )
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed to browse photobank";
     return NextResponse.json(
@@ -28,4 +44,3 @@ export async function GET(request: Request) {
     );
   }
 }
-

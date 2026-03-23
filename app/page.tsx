@@ -33,7 +33,7 @@ type SelectionGroup = {
 
 type DragState =
   | {
-      mode: "content" | "thumb";
+      mode: "thumb";
       startX: number;
       startScrollLeft: number;
       maxScrollLeft: number;
@@ -106,7 +106,6 @@ function TemplateRail({
   const suppressClickRef = useRef(false);
   const suppressClickTimeoutRef = useRef<number | null>(null);
   const [thumb, setThumb] = useState({ width: 100, offset: 0, canScroll: false });
-  const [isDragging, setIsDragging] = useState(false);
 
   const clearSuppressClickTimer = useCallback(() => {
     if (suppressClickTimeoutRef.current !== null) {
@@ -160,7 +159,6 @@ function TemplateRail({
   const finishDrag = useCallback(() => {
     const dragState = dragStateRef.current;
     dragStateRef.current = null;
-    setIsDragging(false);
 
     if (dragState?.moved) {
       suppressClickRef.current = true;
@@ -171,46 +169,6 @@ function TemplateRail({
       }, 160);
     }
   }, [clearSuppressClickTimer]);
-
-  const handleScrollerPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-
-    const target = event.target as HTMLElement;
-    if (target.closest("[data-scroll-thumb='true']")) return;
-
-    const scroller = scrollRef.current;
-    if (!scroller) return;
-
-    clearSuppressClickTimer();
-    suppressClickRef.current = false;
-    dragStateRef.current = {
-      mode: "content",
-      startX: event.clientX,
-      startScrollLeft: scroller.scrollLeft,
-      maxScrollLeft: Math.max(scroller.scrollWidth - scroller.clientWidth, 0),
-      moved: false
-    };
-
-    scroller.setPointerCapture?.(event.pointerId);
-  }, [clearSuppressClickTimer]);
-
-  const handleScrollerPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    const dragState = dragStateRef.current;
-    const scroller = scrollRef.current;
-    if (!dragState || dragState.mode !== "content" || !scroller) return;
-
-    const delta = event.clientX - dragState.startX;
-    if (!dragState.moved && Math.abs(delta) > 4) {
-      dragState.moved = true;
-      setIsDragging(true);
-    }
-
-    if (!dragState.moved) return;
-
-    event.preventDefault();
-    scroller.scrollLeft = clamp(dragState.startScrollLeft - delta, 0, dragState.maxScrollLeft);
-    updateThumb();
-  }, [updateThumb]);
 
   const handleThumbPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -243,7 +201,6 @@ function TemplateRail({
     const delta = event.clientX - dragState.startX;
     if (!dragState.moved && Math.abs(delta) > 2) {
       dragState.moved = true;
-      setIsDragging(true);
     }
 
     const thumbWidthPx = (thumb.width / 100) * track.clientWidth;
@@ -276,12 +233,8 @@ function TemplateRail({
     <div className="selection-rail">
       <div
         ref={scrollRef}
-        className={`selection-group__scroller selection-group__scroller--interactive selection-group__scroller--${variant}${isDragging ? " is-dragging" : ""}`}
+        className={`selection-group__scroller selection-group__scroller--${variant}`}
         onClickCapture={handleClickCapture}
-        onPointerCancel={finishDrag}
-        onPointerDown={handleScrollerPointerDown}
-        onPointerMove={handleScrollerPointerMove}
-        onPointerUp={finishDrag}
         onScroll={updateThumb}
         onWheel={handleWheel}
       >

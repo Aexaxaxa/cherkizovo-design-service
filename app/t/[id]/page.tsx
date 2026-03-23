@@ -1105,129 +1105,154 @@ export default function TemplateEditorPage({
   );
 
   return (
-    <main>
-      <div className="card">
-        <h1>{templateName}</h1>
-        {status ? <p className="muted">{status}</p> : null}
-
-        {error ? (
-          <div className="field-block">
-            <p className="muted" style={{ color: "#a30000" }}>
-              {error.message}
-            </p>
+    <main className="screen-page screen-page--editor">
+      <div className="screen-card screen-card--editor">
+        <section className="editor-form">
+          <div className="editor-form__header">
+            <h1 className="screen-title screen-title--editor">{templateName}</h1>
+            {status ? <p className="editor-inline-note">{status}</p> : null}
+            {error ? <p className="editor-inline-note editor-inline-note--error">{error.message}</p> : null}
+            {loadingSchema ? <p className="editor-inline-note">Загрузка...</p> : null}
           </div>
-        ) : null}
 
-        {loadingSchema ? <p className="muted">Загрузка...</p> : null}
-
-        {textFields.map((field) => (
-          <div key={field.key} className="field-block">
-            <div className="text-field-header">
-              <label htmlFor={field.key}>{field.label}</label>
-              <div className="size-adjust" role="radiogroup" aria-label={`Размер текста ${field.label}`}>
-                <span className="size-adjust-line" />
-                {([-1, 0, 1] as const).map((value) => {
-                  const current = textSizeAdjust[field.key] ?? 0;
-                  const isActive = current === value;
-                  const title = value === -1 ? "-10pt" : value === 1 ? "+10pt" : "0";
-                  const marker = value === -1 ? "-" : value === 1 ? "+" : "";
-                  return (
-                    <button
-                      key={`${field.key}:${value}`}
-                      type="button"
-                      className={`size-adjust-dot${isActive ? " is-active" : ""}`}
-                      aria-label={`${field.label}: ${title}`}
-                      aria-pressed={isActive}
-                      onClick={() =>
-                        setTextSizeAdjust((prev) => ({
-                          ...prev,
-                          [field.key]: value
-                        }))
-                      }
-                    >
-                      {marker}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-            {field.key === RICH_TEXT_FIELD_KEY ? (
-              <>
-                <RichColorTextField
-                  ref={richTextFieldRef}
-                  id={field.key}
-                  segments={richTextFieldSegments}
-                  defaultColor={richTextDefaultColor}
-                  disabled={isGenerating}
-                  onChangeSegments={handleRichTextSegmentsChange}
-                />
-                <div className="rich-text-color-picker" role="group" aria-label="Цвет выделенного текста">
-                  {RICH_TEXT_COLORS.map((color) => (
-                    <button
-                      key={color}
-                      type="button"
-                      className="rich-text-color-dot"
-                      style={{ backgroundColor: color }}
-                      aria-label={`Цвет ${color}`}
-                      onClick={() => {
-                        richTextFieldRef.current?.applyColorToSelection(color);
-                      }}
-                      disabled={isGenerating}
-                    />
-                  ))}
+          <div className="editor-form__body ui-scroll">
+            {textFields.map((field) => (
+              <div key={field.key} className="field-block editor-field-block">
+                <div className="text-field-header">
+                  <label htmlFor={field.key}>{field.label}</label>
+                  <div className="size-adjust" role="radiogroup" aria-label={`Размер текста ${field.label}`}>
+                    <span className="size-adjust-line" />
+                    {([-1, 0, 1] as const).map((value) => {
+                      const current = textSizeAdjust[field.key] ?? 0;
+                      const isActive = current === value;
+                      const title = value === -1 ? "-10pt" : value === 1 ? "+10pt" : "0";
+                      const marker = value === -1 ? "-" : value === 1 ? "+" : "";
+                      return (
+                        <button
+                          key={`${field.key}:${value}`}
+                          type="button"
+                          className={`size-adjust-dot${isActive ? " is-active" : ""}`}
+                          aria-label={`${field.label}: ${title}`}
+                          aria-pressed={isActive}
+                          onClick={() =>
+                            setTextSizeAdjust((prev) => ({
+                              ...prev,
+                              [field.key]: value
+                            }))
+                          }
+                        >
+                          {marker}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
-              </>
-            ) : (
-              <textarea
-                id={field.key}
-                rows={4}
-                value={fields[field.key] ?? ""}
-                onChange={(event) =>
-                  setFields((prev) => ({
-                    ...prev,
-                    [field.key]: event.target.value
-                  }))
-                }
-              />
-            )}
-          </div>
-        ))}
+                {field.key === RICH_TEXT_FIELD_KEY ? (
+                  <>
+                    <RichColorTextField
+                      ref={richTextFieldRef}
+                      id={field.key}
+                      segments={richTextFieldSegments}
+                      defaultColor={richTextDefaultColor}
+                      disabled={isGenerating}
+                      onChangeSegments={handleRichTextSegmentsChange}
+                    />
+                    <div className="rich-text-color-picker" role="group" aria-label="Цвет выделенного текста">
+                      {RICH_TEXT_COLORS.map((color) => (
+                        <button
+                          key={color}
+                          type="button"
+                          className="rich-text-color-dot"
+                          style={{ backgroundColor: color }}
+                          aria-label={`Цвет ${color}`}
+                          onClick={() => {
+                            richTextFieldRef.current?.applyColorToSelection(color);
+                          }}
+                          disabled={isGenerating}
+                        />
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <textarea
+                    id={field.key}
+                    rows={4}
+                    value={fields[field.key] ?? ""}
+                    onChange={(event) =>
+                      setFields((prev) => ({
+                        ...prev,
+                        [field.key]: event.target.value
+                      }))
+                    }
+                  />
+                )}
+              </div>
+            ))}
 
-        {imageFields.map((field) => {
-          const selection = photoSelections[field.key] ?? null;
-          const hasPhoto = Boolean(selection);
-          const localPreview = localPreviewUrls[field.key];
-          const previewSrc =
-            selection && selection.source === "photobank" ? selection.previewUrl : selection && selection.source === "local" ? localPreview : "";
+            {imageFields.map((field) => {
+              const selection = photoSelections[field.key] ?? null;
+              const hasPhoto = Boolean(selection);
+              const localPreview = localPreviewUrls[field.key];
+              const previewSrc =
+                selection && selection.source === "photobank" ? selection.previewUrl : selection && selection.source === "local" ? localPreview : "";
 
-          return (
-            <div key={field.key} className="field-block">
-              <label>{field.label}</label>
-              <div className="row">
-                <button
-                  type="button"
-                  onClick={() => fileInputRefs.current[field.key]?.click()}
-                  disabled={isGenerating}
-                >
-                  Загрузить
-                </button>
-                <button type="button" onClick={() => void openPhotobankForField(field.key)} disabled={isGenerating}>
-                  Фотобанк
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void openCropEditor(field.key)}
-                  disabled={isGenerating || !hasPhoto}
-                >
-                  Обрезать фото
-                </button>
-                {hasPhoto ? (
-                  <button
-                    type="button"
-                    onClick={() => {
+              return (
+                <div key={field.key} className="field-block editor-field-block">
+                  <label>{field.label}</label>
+                  <div className="row">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRefs.current[field.key]?.click()}
+                      disabled={isGenerating}
+                    >
+                      Загрузить
+                    </button>
+                    <button type="button" onClick={() => void openPhotobankForField(field.key)} disabled={isGenerating}>
+                      Фотобанк
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void openCropEditor(field.key)}
+                      disabled={isGenerating || !hasPhoto}
+                    >
+                      Обрезать фото
+                    </button>
+                    {hasPhoto ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPhotoSelections((prev) => ({
+                            ...prev,
+                            [field.key]: null
+                          }));
+                          setPhotoEdits((prev) => {
+                            const next = { ...prev };
+                            delete next[field.key];
+                            return next;
+                          });
+                          closeCropEditor();
+                          setStatus("");
+                        }}
+                        disabled={isGenerating}
+                      >
+                        Сбросить
+                      </button>
+                    ) : null}
+                  </div>
+
+                  <input
+                    ref={(node) => {
+                      fileInputRefs.current[field.key] = node;
+                    }}
+                    id={`upload-${field.key}`}
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    style={{ display: "none" }}
+                    onChange={(event) => {
+                      const file = event.target.files?.[0] ?? null;
                       setPhotoSelections((prev) => ({
                         ...prev,
-                        [field.key]: null
+                        [field.key]: file ? { source: "local", file } : null
                       }));
                       setPhotoEdits((prev) => {
                         const next = { ...prev };
@@ -1236,206 +1261,186 @@ export default function TemplateEditorPage({
                       });
                       closeCropEditor();
                       setStatus("");
+                      event.currentTarget.value = "";
                     }}
-                    disabled={isGenerating}
-                  >
-                    Сбросить
-                  </button>
-                ) : null}
-              </div>
+                  />
 
-              <input
-                ref={(node) => {
-                  fileInputRefs.current[field.key] = node;
-                }}
-                id={`upload-${field.key}`}
-                type="file"
-                accept="image/jpeg,image/png,image/webp"
-                style={{ display: "none" }}
-                onChange={(event) => {
-                  const file = event.target.files?.[0] ?? null;
-                  setPhotoSelections((prev) => ({
-                    ...prev,
-                    [field.key]: file ? { source: "local", file } : null
-                  }));
-                  setPhotoEdits((prev) => {
-                    const next = { ...prev };
-                    delete next[field.key];
-                    return next;
-                  });
-                  closeCropEditor();
-                  setStatus("");
-                  event.currentTarget.value = "";
-                }}
-              />
+                  <p className="muted">
+                    {!selection
+                      ? "Фото не выбрано"
+                      : "Фото выбрано"}
+                  </p>
 
-              <p className="muted">
-                {!selection
-                  ? "Фото не выбрано"
-                  : "Фото выбрано"}
-              </p>
-
-              {previewSrc ? (
-                <div className="selected-photo-preview-wrap">
-                  <img src={previewSrc} alt={field.label} className="selected-photo-preview" />
+                  {previewSrc ? (
+                    <div className="selected-photo-preview-wrap">
+                      <img src={previewSrc} alt={field.label} className="selected-photo-preview" />
+                    </div>
+                  ) : null}
                 </div>
-              ) : null}
-            </div>
-          );
-        })}
+              );
+            })}
+          </div>
+        </section>
 
-        <div className="row">
-          <button type="button" onClick={() => void handleGenerate()} disabled={!canGenerate}>
-            {isGenerating ? "Создание..." : "Создать изображение"}
-          </button>
-          {resultUrl ? (
-            <button type="button" onClick={() => window.open(resultUrl, "_blank", "noopener,noreferrer")}>
-              Скачать
-            </button>
-          ) : null}
-        </div>
-
-        <div className="field-block">
-          {cropEditor ? (
-            <>
-              <p className="muted">Обрезка фото: {cropFieldLabel}</p>
-              <div className="result-preview-wrap">
-                <div className="crop-stage">
-                  <div
-                    className="crop-preview-wrap"
-                    ref={cropPreviewWrapRef}
-                    style={{ aspectRatio: `${cropEditor.frameWidth} / ${cropEditor.frameHeight}` }}
-                  >
-                    {cropEditor.previewUrl ? (
-                      <img src={cropEditor.previewUrl} alt="Template preview" className="crop-stage-preview" />
-                    ) : null}
+        <aside className="editor-preview">
+          <div className="editor-preview__shell">
+            {cropEditor ? (
+              <div className="editor-preview__crop-wrap">
+                <p className="editor-inline-note">Обрезка фото: {cropFieldLabel}</p>
+                <div className="result-preview-wrap result-preview-wrap--editor">
+                  <div className="crop-stage">
                     <div
-                      className="crop-area-container"
-                      style={cropBoxStyle}
-                      ref={(node) => {
-                        cropAreaRef.current = node;
-                        cropperContainerRef.current = node;
-                      }}
+                      className="crop-preview-wrap"
+                      ref={cropPreviewWrapRef}
+                      style={{ aspectRatio: `${cropEditor.frameWidth} / ${cropEditor.frameHeight}` }}
                     >
-                      <div className="cropper-host">
-                        <Cropper
-                          image={cropEditor.imageUrl}
-                          crop={cropEditor.crop}
-                          zoom={cropEditor.zoom}
-                          aspect={cropEditor.photoBox.width / cropEditor.photoBox.height}
-                          cropSize={
-                            cropAreaSize.width > 0 && cropAreaSize.height > 0
-                              ? { width: cropAreaSize.width, height: cropAreaSize.height }
-                              : undefined
-                          }
-                          onCropChange={(nextCrop) =>
-                            setCropEditor((prev) => (prev ? { ...prev, crop: nextCrop } : prev))
-                          }
-                          onZoomChange={(nextZoom) =>
-                            setCropEditor((prev) => (prev ? { ...prev, zoom: Math.max(0.1, Math.min(8, nextZoom)) } : prev))
-                          }
-                          onMediaLoaded={(media) => {
-                            if (!media || !Number.isFinite(media.width) || !Number.isFinite(media.height)) return;
-                            setCropMediaSize({
-                              width: media.width,
-                              height: media.height
-                            });
-                          }}
-                          onCropComplete={(_croppedArea: Area, croppedAreaPixels: Area) => {
-                            setCropEditor((prev) => {
-                              if (!prev) return prev;
-                              return {
-                                ...prev,
-                                cropNorm: {
-                                  x: clamp01(croppedAreaPixels.x / prev.imageNaturalWidth),
-                                  y: clamp01(croppedAreaPixels.y / prev.imageNaturalHeight),
-                                  w: clamp01(croppedAreaPixels.width / prev.imageNaturalWidth),
-                                  h: clamp01(croppedAreaPixels.height / prev.imageNaturalHeight)
-                                }
-                              };
-                            });
-                          }}
-                          objectFit="contain"
-                          showGrid={false}
-                          zoomWithScroll={false}
-                          restrictPosition={false}
-                          style={{
-                            containerStyle: {
-                              width: "100%",
-                              height: "100%",
-                              position: "absolute",
-                              inset: "0",
-                              overflow: "visible"
-                            },
-                            cropAreaStyle: {
-                              width: "100%",
-                              height: "100%"
+                      {cropEditor.previewUrl ? (
+                        <img src={cropEditor.previewUrl} alt="Template preview" className="crop-stage-preview" />
+                      ) : null}
+                      <div
+                        className="crop-area-container"
+                        style={cropBoxStyle}
+                        ref={(node) => {
+                          cropAreaRef.current = node;
+                          cropperContainerRef.current = node;
+                        }}
+                      >
+                        <div className="cropper-host">
+                          <Cropper
+                            image={cropEditor.imageUrl}
+                            crop={cropEditor.crop}
+                            zoom={cropEditor.zoom}
+                            aspect={cropEditor.photoBox.width / cropEditor.photoBox.height}
+                            cropSize={
+                              cropAreaSize.width > 0 && cropAreaSize.height > 0
+                                ? { width: cropAreaSize.width, height: cropAreaSize.height }
+                                : undefined
                             }
-                          }}
-                        />
-                      </div>
-                      <div className="crop-handles-layer" aria-hidden="true">
-                        {resizeHandles.map((handle) => (
-                          <button
-                            key={handle.key}
-                            type="button"
-                            className="crop-handle"
-                            data-handle={handle.key}
-                            style={{
-                              left: `${handle.x}px`,
-                              top: `${handle.y}px`,
-                              cursor: handle.cursor
+                            onCropChange={(nextCrop) =>
+                              setCropEditor((prev) => (prev ? { ...prev, crop: nextCrop } : prev))
+                            }
+                            onZoomChange={(nextZoom) =>
+                              setCropEditor((prev) => (prev ? { ...prev, zoom: Math.max(0.1, Math.min(8, nextZoom)) } : prev))
+                            }
+                            onMediaLoaded={(media) => {
+                              if (!media || !Number.isFinite(media.width) || !Number.isFinite(media.height)) return;
+                              setCropMediaSize({
+                                width: media.width,
+                                height: media.height
+                              });
                             }}
-                            onPointerDown={onResizeHandlePointerDown}
-                            aria-label="Изменить масштаб"
+                            onCropComplete={(_croppedArea: Area, croppedAreaPixels: Area) => {
+                              setCropEditor((prev) => {
+                                if (!prev) return prev;
+                                return {
+                                  ...prev,
+                                  cropNorm: {
+                                    x: clamp01(croppedAreaPixels.x / prev.imageNaturalWidth),
+                                    y: clamp01(croppedAreaPixels.y / prev.imageNaturalHeight),
+                                    w: clamp01(croppedAreaPixels.width / prev.imageNaturalWidth),
+                                    h: clamp01(croppedAreaPixels.height / prev.imageNaturalHeight)
+                                  }
+                                };
+                              });
+                            }}
+                            objectFit="contain"
+                            showGrid={false}
+                            zoomWithScroll={false}
+                            restrictPosition={false}
+                            style={{
+                              containerStyle: {
+                                width: "100%",
+                                height: "100%",
+                                position: "absolute",
+                                inset: "0",
+                                overflow: "visible"
+                              },
+                              cropAreaStyle: {
+                                width: "100%",
+                                height: "100%"
+                              }
+                            }}
                           />
-                        ))}
+                        </div>
+                        <div className="crop-handles-layer" aria-hidden="true">
+                          {resizeHandles.map((handle) => (
+                            <button
+                              key={handle.key}
+                              type="button"
+                              className="crop-handle"
+                              data-handle={handle.key}
+                              style={{
+                                left: `${handle.x}px`,
+                                top: `${handle.y}px`,
+                                cursor: handle.cursor
+                              }}
+                              onPointerDown={onResizeHandlePointerDown}
+                              aria-label="Изменить масштаб"
+                            />
+                          ))}
+                        </div>
                       </div>
                     </div>
                   </div>
                 </div>
               </div>
-              <div className="row" style={{ marginTop: 12 }}>
+            ) : (
+              <div className="result-preview-wrap result-preview-wrap--editor" aria-busy={isGenerating || (Boolean(resultUrl) && !resultLoaded)}>
+                {showResultView ? (
+                  <div className="result-preview-stack">
+                    <img
+                      src={resultUrl ?? ""}
+                      alt="Готовый макет"
+                      className="result-preview-image"
+                      onLoad={() => setResultLoaded(true)}
+                      onError={() => {
+                        const friendly = asUiError("E_RESULT_LOAD_FAILED", "Не удалось загрузить созданный макет");
+                        setError(friendly);
+                        setStatus(friendly.message);
+                        setResultLoaded(false);
+                        setResultUrl(null);
+                      }}
+                      style={{ opacity: resultLoaded ? 1 : 0 }}
+                    />
+                  </div>
+                ) : previewUrl ? (
+                  <img src={previewUrl} alt="Preview template" className="result-preview-image" />
+                ) : (
+                  <div className="result-preview-empty muted">Preview unavailable</div>
+                )}
+                {isGenerating || (Boolean(resultUrl) && !resultLoaded) ? (
+                  <div className="result-preview-loader" role="status" aria-live="polite">
+                    <span className="result-preview-spinner" />
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </div>
+
+          <div className="editor-action-row">
+            {cropEditor ? (
+              <>
                 <button type="button" onClick={() => confirmCropEditor()} disabled={!cropEditor.cropNorm}>
                   Подтвердить
                 </button>
                 <button type="button" onClick={() => cancelCropEditor()}>
                   Отмена
                 </button>
-              </div>
-            </>
-          ) : (
-            <div className="result-preview-wrap" aria-busy={isGenerating || (Boolean(resultUrl) && !resultLoaded)}>
-              {showResultView ? (
-                <div className="result-preview-stack">
-                  <img
-                    src={resultUrl ?? ""}
-                    alt="Готовый макет"
-                    className="result-preview-image"
-                    onLoad={() => setResultLoaded(true)}
-                    onError={() => {
-                      const friendly = asUiError("E_RESULT_LOAD_FAILED", "Не удалось загрузить созданный макет");
-                      setError(friendly);
-                      setStatus(friendly.message);
-                      setResultLoaded(false);
-                      setResultUrl(null);
-                    }}
-                    style={{ opacity: resultLoaded ? 1 : 0 }}
-                  />
-                </div>
-              ) : previewUrl ? (
-                <img src={previewUrl} alt="Preview template" className="result-preview-image" />
-              ) : (
-                <div className="result-preview-empty muted">Preview unavailable</div>
-              )}
-              {isGenerating || (Boolean(resultUrl) && !resultLoaded) ? (
-                <div className="result-preview-loader" role="status" aria-live="polite">
-                  <span className="result-preview-spinner" />
-                </div>
-              ) : null}
-            </div>
-          )}
-        </div>
+              </>
+            ) : (
+              <>
+                <button type="button" onClick={() => void handleGenerate()} disabled={!canGenerate}>
+                  {isGenerating ? "Создание..." : "Создать изображение"}
+                </button>
+                {resultUrl ? (
+                  <button type="button" onClick={() => window.open(resultUrl, "_blank", "noopener,noreferrer")}>
+                    Скачать
+                  </button>
+                ) : null}
+              </>
+            )}
+          </div>
+        </aside>
       </div>
 
       {photobankOpen ? (

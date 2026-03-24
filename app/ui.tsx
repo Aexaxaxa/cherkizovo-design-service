@@ -193,10 +193,10 @@ export function getNetworkLabel(network: TemplateNetwork): string {
 }
 
 export const selectionSteps: StepItem[] = [
-  { icon: "selectTemplate", label: "Выбери \n шаблон" },
+  { icon: "selectTemplate", label: "Выбери\nшаблон" },
   { icon: "upload", label: "Загрузи/выбери\nфото" },
-  { icon: "text", label: "Заполни шаблон\nконтентом" },
-  { icon: "crop", label: "Обрежь фото \n под шаблон" },
+  { icon: "edit", label: "Заполни шаблон\nконтентом" },
+  { icon: "crop", label: "Обрежь фото\nпод шаблон" },
   { icon: "generate", label: "Сгенерируй\nмакет" },
   { icon: "download", label: "Скачай\nмакет" }
 ];

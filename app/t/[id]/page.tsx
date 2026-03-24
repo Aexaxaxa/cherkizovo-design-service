@@ -217,6 +217,13 @@ type CropMediaSize = {
   height: number;
 };
 
+type PhotobankScrollDragState = {
+  pointerId: number;
+  startY: number;
+  startScrollTop: number;
+  maxScrollTop: number;
+} | null;
+
 function asUiError(code: string, message: string): UiError {
   return { code, message };
 }
@@ -288,6 +295,10 @@ function clamp01(value: number): number {
   if (value < 0) return 0;
   if (value > 1) return 1;
   return value;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
 }
 
 function getEditorViewportState(width: number, height: number): EditorViewportState {
@@ -563,6 +574,14 @@ export default function TemplateEditorPage({
   const cropAreaRef = useRef<HTMLDivElement | null>(null);
   const cropperContainerRef = useRef<HTMLDivElement | null>(null);
   const resizeHandleStateRef = useRef<ResizeHandleState | null>(null);
+  const photobankContentRef = useRef<HTMLDivElement | null>(null);
+  const photobankTrackRef = useRef<HTMLDivElement | null>(null);
+  const photobankScrollDragRef = useRef<PhotobankScrollDragState>(null);
+  const [photobankScrollThumb, setPhotobankScrollThumb] = useState({
+    height: 100,
+    offset: 0,
+    canScroll: false
+  });
 
   const closeCropEditor = useCallback(() => {
     if (cropObjectUrlRef.current) {
@@ -608,6 +627,23 @@ export default function TemplateEditorPage({
     [photobankItems]
   );
 
+  const updatePhotobankScrollThumb = useCallback(() => {
+    const scroller = photobankContentRef.current;
+    if (!scroller) return;
+
+    const maxScrollTop = Math.max(scroller.scrollHeight - scroller.clientHeight, 0);
+    if (maxScrollTop <= 0 || scroller.scrollHeight <= 0) {
+      setPhotobankScrollThumb({ height: 100, offset: 0, canScroll: false });
+      return;
+    }
+
+    const visibleRatio = scroller.clientHeight / scroller.scrollHeight;
+    const height = clamp(visibleRatio * 100, 16, 100);
+    const travel = 100 - height;
+    const offset = travel * (scroller.scrollTop / maxScrollTop);
+    setPhotobankScrollThumb({ height, offset, canScroll: true });
+  }, []);
+
   useEffect(() => {
     const objectUrls: Record<string, string> = {};
 
@@ -640,6 +676,49 @@ export default function TemplateEditorPage({
     window.addEventListener("resize", syncViewport);
     return () => window.removeEventListener("resize", syncViewport);
   }, []);
+
+  useEffect(() => {
+    if (!photobankOpen || typeof document === "undefined") return;
+
+    const html = document.documentElement;
+    const body = document.body;
+    const prevHtmlOverflow = html.style.overflow;
+    const prevBodyOverflow = body.style.overflow;
+
+    html.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+
+    return () => {
+      html.style.overflow = prevHtmlOverflow;
+      body.style.overflow = prevBodyOverflow;
+    };
+  }, [photobankOpen]);
+
+  useEffect(() => {
+    if (!photobankOpen) return;
+
+    updatePhotobankScrollThumb();
+
+    const handleResize = () => updatePhotobankScrollThumb();
+    window.addEventListener("resize", handleResize);
+
+    const scroller = photobankContentRef.current;
+    const resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => updatePhotobankScrollThumb());
+
+    if (scroller) {
+      resizeObserver?.observe(scroller);
+      Array.from(scroller.children).forEach((child) => {
+        if (child instanceof HTMLElement) {
+          resizeObserver?.observe(child);
+        }
+      });
+    }
+
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      resizeObserver?.disconnect();
+    };
+  }, [photobankOpen, photobankItems.length, photobankLoading, photobankLoadingMore, updatePhotobankScrollThumb]);
 
   useEffect(() => {
     setPreviewLoaded(!previewUrl);
@@ -1138,13 +1217,58 @@ export default function TemplateEditorPage({
     }
   }
 
-  const photobankTitle = isRootPhotobankPath(photobankPath)
-    ? "Фотобанк"
-    : currentFolderName
-      ? `Фотобанк: ${currentFolderName}`
-      : "Фотобанк";
-  const showResultView = Boolean(cropEditor === null && resultUrl);
+  const isPhotobankRoot = isRootPhotobankPath(photobankPath);
+  const photobankTitle = isPhotobankRoot ? "Фотобанк" : currentFolderName ?? folderNameByPath[photobankPath] ?? "Фотобанк";
+  const canGoBackInPhotobank = !isPhotobankRoot && !photobankLoading && !photobankLoadingMore;
+  const photobankInitialLoading = photobankLoading && photobankItems.length === 0;
   const editorScale = editorViewport.isMobile ? 1 : editorViewport.scale;
+  const photobankIconSizes = editorViewport.isMobile
+    ? { header: 28, close: 28, folder: 66 }
+    : { header: Math.max(28, 40 * editorScale), close: Math.max(28, 40 * editorScale), folder: Math.max(66, 86 * editorScale) };
+  const finishPhotobankThumbDrag = useCallback((pointerId?: number) => {
+    const state = photobankScrollDragRef.current;
+    if (!state) return;
+    if (typeof pointerId === "number" && state.pointerId !== pointerId) return;
+
+    const track = photobankTrackRef.current;
+    if (track && track.hasPointerCapture(state.pointerId)) {
+      track.releasePointerCapture(state.pointerId);
+    }
+    photobankScrollDragRef.current = null;
+  }, []);
+  const handlePhotobankThumbPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+
+    const scroller = photobankContentRef.current;
+    if (!scroller) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    photobankScrollDragRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startScrollTop: scroller.scrollTop,
+      maxScrollTop: Math.max(scroller.scrollHeight - scroller.clientHeight, 0)
+    };
+
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }, []);
+  const handlePhotobankThumbPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const state = photobankScrollDragRef.current;
+    const scroller = photobankContentRef.current;
+    const track = photobankTrackRef.current;
+    if (!state || !scroller || !track) return;
+    if (state.pointerId !== event.pointerId) return;
+
+    const delta = event.clientY - state.startY;
+    const thumbHeightPx = (photobankScrollThumb.height / 100) * track.clientHeight;
+    const thumbTravelPx = Math.max(track.clientHeight - thumbHeightPx, 1);
+    const nextScrollTop = state.startScrollTop + (delta / thumbTravelPx) * state.maxScrollTop;
+    scroller.scrollTop = clamp(nextScrollTop, 0, state.maxScrollTop);
+    updatePhotobankScrollThumb();
+  }, [photobankScrollThumb.height, updatePhotobankScrollThumb]);
+  const showResultView = Boolean(cropEditor === null && resultUrl);
   const editorRootStyle = useMemo(
     () =>
       ({
@@ -1385,6 +1509,13 @@ export default function TemplateEditorPage({
       window.addEventListener("pointercancel", onResizeHandlePointerUp);
     },
     [cropEditor, cropMediaSize, imageRect, onResizeHandlePointerMove, onResizeHandlePointerUp]
+  );
+
+  useEffect(
+    () => () => {
+      finishPhotobankThumbDrag();
+    },
+    [finishPhotobankThumbDrag]
   );
 
   useEffect(
@@ -1779,100 +1910,151 @@ export default function TemplateEditorPage({
       {error ? <EditorWarningModal error={error} iconSizes={iconSizes} onClose={() => setError(null)} /> : null}
 
       {photobankOpen ? (
-        <div className="modal-backdrop" onClick={() => setPhotobankOpen(false)}>
-          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-header">
-              <h2>{photobankTitle}</h2>
-              <button type="button" onClick={() => setPhotobankOpen(false)}>
-                Закрыть
-              </button>
-            </div>
+        <div className="photobank-overlay" onClick={() => setPhotobankOpen(false)}>
+          <div
+            className="photobank-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="photobank-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="photobank-modal__header">
+              <h2 className="photobank-modal__title" id="photobank-title">
+                {photobankTitle}
+              </h2>
 
-            {!isRootPhotobankPath(photobankPath) ? (
-              <div className="row">
+              <div className="photobank-modal__actions">
                 <button
                   type="button"
+                  className={`photobank-back-button${canGoBackInPhotobank ? " is-active" : ""}`}
+                  disabled={!canGoBackInPhotobank}
                   onClick={() => {
                     const parentPath = getParentPhotobankPath(photobankPath);
                     const parentName = isRootPhotobankPath(parentPath) ? null : folderNameByPath[parentPath] ?? null;
                     void loadPhotobank(parentPath, false, parentName);
                   }}
-                  disabled={photobankLoading || photobankLoadingMore}
                 >
-                  Назад
+                  <AppIcon
+                    name="back"
+                    tone={canGoBackInPhotobank ? "white" : "red"}
+                    size={photobankIconSizes.header}
+                  />
+                  <span className="photobank-back-button__label">Назад</span>
                 </button>
-              </div>
-            ) : null}
 
-            {photobankError ? <p className="muted" style={{ color: "#a30000" }}>{photobankError}</p> : null}
-            {photobankLoading ? <p className="muted">Загрузка...</p> : null}
-
-            {photobankDirs.length > 0 ? (
-              <div className="photobank-folders">
-                {photobankDirs.map((item) => (
-                  <button
-                    key={item.path}
-                    type="button"
-                    className="photobank-item photobank-folder"
-                    onClick={() => void loadPhotobank(item.path, false, item.name)}
-                    disabled={photobankLoading || photobankLoadingMore}
-                    title={item.name}
-                    aria-label={item.name}
-                  >
-                    <span className="photobank-folder-content">
-                      <span className="photobank-folder-icon" aria-hidden="true">📁</span>
-                      <span className="photobank-folder-name">{item.name}</span>
-                    </span>
-                  </button>
-                ))}
-              </div>
-            ) : null}
-
-            <div className="photobank-photo-grid">
-              {photobankFiles.map((item) => (
                 <button
                   type="button"
-                  className="photobank-photo-card"
-                  key={item.path}
-                  disabled={!activePhotoField}
-                  title={item.name}
-                  aria-label={item.name}
-                  onClick={() => {
-                    if (!activePhotoField) return;
-                    setPhotoSelections((prev) => ({
-                      ...prev,
-                      [activePhotoField]: {
-                        source: "photobank",
-                    
-                        path: item.path,
-                        name: item.name,
-                        previewUrl: item.previewUrl
-                      }
-                    }));
-                    setPhotoEdits((prev) => {
-                      const next = { ...prev };
-                      delete next[activePhotoField];
-                      return next;
-                    });
-                    closeCropEditor();
-                    setPhotobankOpen(false);
-                  }}
+                  className="photobank-close-button"
+                  aria-label="Закрыть фотобанк"
+                  onClick={() => setPhotobankOpen(false)}
                 >
-                  <img src={item.previewUrl} alt={item.name} className="photobank-preview" />
+                  <AppIcon name="close" tone="white" size={photobankIconSizes.close} />
                 </button>
-              ))}
+              </div>
             </div>
-            {photobankHasMore ? (
-              <div className="row" style={{ marginTop: 12 }}>
-                <button
-                  type="button"
-                  onClick={() => void loadPhotobank(photobankPath, true)}
-                  disabled={photobankLoading || photobankLoadingMore}
-                >
-                  {photobankLoadingMore ? "Загрузка..." : "Показать еще"}
-                </button>
+
+            <div className="photobank-modal__body">
+              <div
+                ref={photobankContentRef}
+                className="photobank-modal__content"
+                onScroll={updatePhotobankScrollThumb}
+              >
+                {photobankError ? <p className="photobank-state photobank-state--error">{photobankError}</p> : null}
+
+                {photobankInitialLoading ? (
+                  <div className="photobank-state photobank-state--loading" role="status" aria-live="polite">
+                    <LoadingMark className="photobank-state__mark" />
+                  </div>
+                ) : (
+                  <>
+                    <div className="photobank-grid">
+                      {photobankDirs.map((item) => (
+                        <button
+                          key={item.path}
+                          type="button"
+                          className="photobank-card photobank-card--folder"
+                          onClick={() => void loadPhotobank(item.path, false, item.name)}
+                          disabled={photobankLoading || photobankLoadingMore}
+                          title={item.name}
+                          aria-label={item.name}
+                        >
+                          <span className="photobank-card__icon" aria-hidden="true">
+                            <AppIcon name="folder" tone="white" size={photobankIconSizes.folder} />
+                          </span>
+                          <span className="photobank-card__title">{item.name}</span>
+                        </button>
+                      ))}
+
+                      {photobankFiles.map((item) => (
+                        <button
+                          type="button"
+                          className="photobank-card photobank-card--image"
+                          key={item.path}
+                          disabled={!activePhotoField}
+                          title={item.name}
+                          aria-label={item.name}
+                          onClick={() => {
+                            if (!activePhotoField) return;
+                            setPhotoSelections((prev) => ({
+                              ...prev,
+                              [activePhotoField]: {
+                                source: "photobank",
+                                path: item.path,
+                                name: item.name,
+                                previewUrl: item.previewUrl
+                              }
+                            }));
+                            setPhotoEdits((prev) => {
+                              const next = { ...prev };
+                              delete next[activePhotoField];
+                              return next;
+                            });
+                            closeCropEditor();
+                            setPhotobankOpen(false);
+                          }}
+                        >
+                          <img src={item.previewUrl} alt={item.name} className="photobank-card__image" />
+                        </button>
+                      ))}
+                    </div>
+
+                    {photobankLoadingMore ? (
+                      <div className="photobank-state photobank-state--loading-more" role="status" aria-live="polite">
+                        <LoadingMark className="photobank-state__mark photobank-state__mark--small" />
+                      </div>
+                    ) : null}
+
+                    {photobankHasMore && !photobankLoadingMore ? (
+                      <div className="photobank-more">
+                        <button
+                          type="button"
+                          className="photobank-more__button"
+                          onClick={() => void loadPhotobank(photobankPath, true)}
+                          disabled={photobankLoading || photobankLoadingMore}
+                        >
+                          Показать еще
+                        </button>
+                      </div>
+                    ) : null}
+                  </>
+                )}
               </div>
-            ) : null}
+
+              <div className="photobank-scroll" ref={photobankTrackRef}>
+                <div
+                  aria-hidden="true"
+                  className={`photobank-scroll__value${photobankScrollThumb.canScroll ? "" : " is-static"}`}
+                  onPointerCancel={(event) => finishPhotobankThumbDrag(event.pointerId)}
+                  onPointerDown={handlePhotobankThumbPointerDown}
+                  onPointerMove={handlePhotobankThumbPointerMove}
+                  onPointerUp={(event) => finishPhotobankThumbDrag(event.pointerId)}
+                  style={{
+                    height: `${photobankScrollThumb.height}%`,
+                    top: `${photobankScrollThumb.offset}%`
+                  }}
+                />
+              </div>
+            </div>
           </div>
         </div>
       ) : null}

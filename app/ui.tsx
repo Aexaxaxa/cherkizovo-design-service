@@ -44,6 +44,7 @@ export type IconName =
   | "folder"
   | "gallery"
   | "generate"
+  | "letterCase"
   | "minus"
   | "plus"
   | "refresh"
@@ -105,6 +106,10 @@ const iconRegistry: Record<IconName, Partial<Record<IconTone, AssetLike>>> = {
     red: confettiRed,
     white: confettiWhite
   },
+  letterCase: {
+    red: letterCaseRed,
+    white: letterCaseWhite
+  },
   minus: {
     red: minusSmallRed,
     white: minusSmallWhite
@@ -121,7 +126,7 @@ const iconRegistry: Record<IconName, Partial<Record<IconTone, AssetLike>>> = {
     red: pictureRed
   },
   text: {
-    red: editRed,
+    red: letterCaseRed,
     white: letterCaseWhite
   },
   upload: {
@@ -164,7 +169,7 @@ export function AppIcon({ name, tone = "red", className, size = 40, title }: Ico
 }
 
 export function LoadingMark({ className }: { className?: string }) {
-  return <img className={className ?? "loading-mark"} src={getAssetUrl(loader)} alt="" aria-hidden="true" />;
+  return <img className={`loading-mark${className ? ` ${className}` : ""}`} src={getAssetUrl(loader)} alt="" aria-hidden="true" />;
 }
 
 export function BrandLogo({ tone = "white", className }: { tone?: "white" | "red"; className?: string }) {
@@ -195,4 +200,3 @@ export const selectionSteps: StepItem[] = [
   { icon: "generate", label: "Сгенерируй\nмакет" },
   { icon: "download", label: "Скачай\nмакет" }
 ];
-

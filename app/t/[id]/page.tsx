@@ -8,9 +8,11 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type PointerEvent as ReactPointerEvent
 } from "react";
 import { RichColorTextField, type RichColorTextFieldHandle } from "./RichColorTextField";
+import { AppIcon, LoadingMark, type IconName } from "@/app/ui";
 import {
   getPlainTextFromSegments,
   normalizeHexColor,
@@ -69,9 +71,40 @@ type UiError = {
 };
 
 type TextSizeAdjustValue = -1 | 0 | 1;
+type EditorActionTone = "primary" | "soft";
+type EditorViewportState = {
+  width: number;
+  height: number;
+  scaleX: number;
+  scaleY: number;
+  scale: number;
+  isMobile: boolean;
+};
+type EditorIconSizes = {
+  actionCard: number;
+  actionButton: number;
+  refresh: number;
+  warning: number;
+  close: number;
+};
 
 const RICH_TEXT_FIELD_KEY = "text";
-const RICH_TEXT_COLORS = ["#CE0037", "#FFFFFF", "#000000"] as const;
+const RICH_TEXT_COLORS = ["#CE0037", "#000000"] as const;
+const EDITOR_REFERENCE = {
+  width: 1920,
+  height: 1080,
+  mobileBreakpoint: 980
+} as const;
+const EDITOR_ICON_MAP = {
+  cancel: "close",
+  confirm: "confirm",
+  create: "create",
+  crop: "crop",
+  download: "download",
+  photobank: "gallery",
+  refresh: "refresh",
+  upload: "upload"
+} as const satisfies Record<string, IconName>;
 
 type PhotobankDirItem = {
   type: "dir";
@@ -257,6 +290,207 @@ function clamp01(value: number): number {
   return value;
 }
 
+function getEditorViewportState(width: number, height: number): EditorViewportState {
+  const safeWidth = width > 0 ? width : EDITOR_REFERENCE.width;
+  const safeHeight = height > 0 ? height : EDITOR_REFERENCE.height;
+  const scaleX = safeWidth / EDITOR_REFERENCE.width;
+  const scaleY = safeHeight / EDITOR_REFERENCE.height;
+  return {
+    width: safeWidth,
+    height: safeHeight,
+    scaleX,
+    scaleY,
+    scale: Math.min(scaleX, scaleY),
+    isMobile: safeWidth < EDITOR_REFERENCE.mobileBreakpoint
+  };
+}
+
+function getDisplayFieldLabel(field: Pick<SchemaField, "key" | "label">): string {
+  const key = field.key.trim().toLowerCase();
+
+  if (key === "text" || key === "text_title") return "Заголовок";
+  if (key === "text_subtitle") return "Подзаголовок";
+  if (key === "text_post") return "Должность";
+  if (key === "text_name") return "Фамилия Имя";
+  if (key === "text_quote") return "Цитата";
+  if (key === "photo") return "Фото";
+
+  const photoMatch = key.match(/^photo_(\d+)$/);
+  if (photoMatch) {
+    return `Фото ${photoMatch[1]}`;
+  }
+
+  return field.label;
+}
+
+function isMultilineTextField(field: SchemaField): boolean {
+  const key = field.key.toLowerCase();
+  const label = getDisplayFieldLabel(field).toLowerCase();
+  return field.key === RICH_TEXT_FIELD_KEY || key.includes("quote") || label.includes("цитат");
+}
+
+function getEditorActionTone(isActive: boolean): EditorActionTone {
+  return isActive ? "primary" : "soft";
+}
+
+function TextSizeControl({
+  fieldLabel,
+  value,
+  disabled,
+  onChange
+}: {
+  fieldLabel: string;
+  value: TextSizeAdjustValue;
+  disabled?: boolean;
+  onChange: (next: TextSizeAdjustValue) => void;
+}) {
+  return (
+    <div className="editor-size-control" role="radiogroup" aria-label={`Размер текста ${fieldLabel}`}>
+      <span className="editor-size-control__line" aria-hidden="true" />
+      {([-1, 0, 1] as const).map((option) => {
+        const isActive = option === value;
+        const label = option === -1 ? "Уменьшить на 10pt" : option === 1 ? "Увеличить на 10pt" : "Размер из шаблона";
+        return (
+          <button
+            key={`${fieldLabel}:${option}`}
+            type="button"
+            className={`editor-size-control__button${isActive ? " is-active" : ""}`}
+            aria-label={`${fieldLabel}: ${label}`}
+            aria-pressed={isActive}
+            disabled={disabled}
+            onClick={() => onChange(option)}
+          >
+            <AppIcon
+              name={option === 0 ? "letterCase" : option === -1 ? "minus" : "plus"}
+              tone={isActive ? "white" : "red"}
+              size={20}
+            />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function TextColorControl({
+  disabled,
+  onSelectColor
+}: {
+  disabled?: boolean;
+  onSelectColor: (color: (typeof RICH_TEXT_COLORS)[number]) => void;
+}) {
+  return (
+    <div className="editor-color-control" role="group" aria-label="Цвет текста">
+      {RICH_TEXT_COLORS.map((color) => (
+        <button
+          key={color}
+          type="button"
+          className="editor-color-control__swatch"
+          style={{ backgroundColor: color }}
+          aria-label={`Выбрать цвет ${color}`}
+          disabled={disabled}
+          onClick={() => onSelectColor(color)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function PhotoSelectCard({
+  label,
+  icon,
+  previewSrc,
+  iconSize,
+  disabled,
+  onClick
+}: {
+  label: string;
+  icon: IconName;
+  previewSrc?: string;
+  iconSize: number;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`editor-photo-card${previewSrc ? " is-filled" : ""}`}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <span className="editor-photo-card__box">
+        {previewSrc ? (
+          <>
+            <img src={previewSrc} alt="" className="editor-photo-card__preview" />
+            <span className="editor-photo-card__preview-icon" aria-hidden="true">
+              <AppIcon name={icon} tone="red" size={iconSize} />
+            </span>
+          </>
+        ) : (
+          <AppIcon name={icon} tone="red" size={iconSize} />
+        )}
+      </span>
+      <span className="editor-photo-card__caption">{label}</span>
+    </button>
+  );
+}
+
+function EditorActionButton({
+  label,
+  icon,
+  tone,
+  iconSize,
+  disabled,
+  onClick
+}: {
+  label: string;
+  icon: IconName;
+  tone: EditorActionTone;
+  iconSize: number;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`editor-action-button editor-action-button--${tone}`}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <AppIcon name={icon} tone={tone === "primary" ? "white" : "red"} size={iconSize} />
+      <span className="editor-action-button__label">{label}</span>
+    </button>
+  );
+}
+
+function EditorWarningModal({
+  error,
+  iconSizes,
+  onClose
+}: {
+  error: UiError;
+  iconSizes: EditorIconSizes;
+  onClose: () => void;
+}) {
+  return (
+    <div className="editor-overlay" role="dialog" aria-modal="true" aria-labelledby="editor-warning-title">
+      <div className="editor-warning-modal">
+        <button type="button" className="editor-warning-modal__close" aria-label="Закрыть предупреждение" onClick={onClose}>
+          <AppIcon name="close" tone="red" size={iconSizes.close} />
+        </button>
+        <div className="editor-warning-modal__header">
+          <AppIcon name="warning" tone="red" size={iconSizes.warning} />
+          <h2 className="editor-warning-modal__title" id="editor-warning-title">
+            Предупреждение
+          </h2>
+        </div>
+        <p className="editor-warning-modal__message">{error.message}</p>
+        <p className="editor-warning-modal__code">Код ошибки: {error.code}</p>
+      </div>
+    </div>
+  );
+}
+
 async function measureImageSize(url: string): Promise<{ width: number; height: number }> {
   return await new Promise<{ width: number; height: number }>((resolve, reject) => {
     const image = new Image();
@@ -299,8 +533,12 @@ export default function TemplateEditorPage({
   const [loadingSchema, setLoadingSchema] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewLoaded, setPreviewLoaded] = useState(false);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [resultLoaded, setResultLoaded] = useState(false);
+  const [editorViewport, setEditorViewport] = useState<EditorViewportState>(() =>
+    getEditorViewportState(EDITOR_REFERENCE.width, EDITOR_REFERENCE.height)
+  );
 
   const [localPreviewUrls, setLocalPreviewUrls] = useState<Record<string, string>>({});
   const [photoEdits, setPhotoEdits] = useState<Record<string, PhotoEditState>>({});
@@ -337,6 +575,13 @@ export default function TemplateEditorPage({
 
   const textFields = useMemo(() => schemaFields.filter((field) => field.type === "text"), [schemaFields]);
   const imageFields = useMemo(() => schemaFields.filter((field) => field.type === "image"), [schemaFields]);
+  const displayFieldLabels = useMemo(
+    () =>
+      Object.fromEntries(
+        schemaFields.map((field) => [field.key, getDisplayFieldLabel(field)])
+      ) as Record<string, string>,
+    [schemaFields]
+  );
   const richTextDefaultColor = useMemo(
     () => normalizeHexColor(textDefaultColors[RICH_TEXT_FIELD_KEY], "#000000"),
     [textDefaultColors]
@@ -385,6 +630,20 @@ export default function TemplateEditorPage({
       }
     };
   }, [photoSelections]);
+
+  useEffect(() => {
+    const syncViewport = () => {
+      setEditorViewport(getEditorViewportState(window.innerWidth, window.innerHeight));
+    };
+
+    syncViewport();
+    window.addEventListener("resize", syncViewport);
+    return () => window.removeEventListener("resize", syncViewport);
+  }, []);
+
+  useEffect(() => {
+    setPreviewLoaded(!previewUrl);
+  }, [previewUrl]);
 
   const loadPreview = useCallback(async (templateId: string, templateNameValue: string) => {
     try {
@@ -527,7 +786,13 @@ export default function TemplateEditorPage({
     void loadSchema();
   }, [loadSchema]);
 
-  const canGenerate = useMemo(() => !loadingSchema && !isGenerating, [isGenerating, loadingSchema]);
+  const isSchemaComplete = useMemo(() => {
+    if (loadingSchema) return false;
+    const allTextFilled = textFields.every((field) => (fields[field.key] ?? "").trim().length > 0);
+    const allImagesSelected = imageFields.every((field) => Boolean(photoSelections[field.key]));
+    return allTextFilled && allImagesSelected;
+  }, [fields, imageFields, loadingSchema, photoSelections, textFields]);
+  const canGenerate = useMemo(() => isSchemaComplete && !isGenerating, [isGenerating, isSchemaComplete]);
 
   const handleRichTextSegmentsChange = useCallback(
     (nextSegments: TextSegment[]) => {
@@ -630,11 +895,6 @@ export default function TemplateEditorPage({
   const getPhotoFieldGeometry = useCallback(
     (fieldName: string) => schemaPhotoFields.find((item) => item.name.toLowerCase() === fieldName.toLowerCase()) ?? null,
     [schemaPhotoFields]
-  );
-
-  const cropFieldLabel = useMemo(
-    () => imageFields.find((field) => field.key === cropEditor?.fieldName)?.label ?? cropEditor?.fieldName ?? "",
-    [cropEditor?.fieldName, imageFields]
   );
 
   const openCropEditor = useCallback(
@@ -748,13 +1008,18 @@ export default function TemplateEditorPage({
   function validateBeforeGenerate(): UiError | null {
     for (const field of textFields) {
       const value = fields[field.key]?.trim() ?? "";
-      if (!value) return asUiError(`E_TEXT_REQUIRED_${field.key}`, `Заполните поле "${field.label}"`);
+      if (!value) {
+        return asUiError(`E_TEXT_REQUIRED_${field.key}`, `Заполните поле "${displayFieldLabels[field.key] ?? field.label}"`);
+      }
     }
 
     for (const field of imageFields) {
       const selection = photoSelections[field.key];
       if (!selection) {
-        return asUiError(`E_PHOTO_REQUIRED_${field.key}`, `Выберите фото для поля "${field.label}"`);
+        return asUiError(
+          `E_PHOTO_REQUIRED_${field.key}`,
+          `Выберите фото для поля "${displayFieldLabels[field.key] ?? field.label}"`
+        );
       }
     }
 
@@ -879,6 +1144,39 @@ export default function TemplateEditorPage({
       ? `Фотобанк: ${currentFolderName}`
       : "Фотобанк";
   const showResultView = Boolean(cropEditor === null && resultUrl);
+  const editorScale = editorViewport.isMobile ? 1 : editorViewport.scale;
+  const editorRootStyle = useMemo(
+    () =>
+      ({
+        "--editor-scale": String(editorScale)
+      }) as CSSProperties,
+    [editorScale]
+  );
+  const iconSizes = useMemo<EditorIconSizes>(() => {
+    if (editorViewport.isMobile) {
+      return {
+        actionCard: 30,
+        actionButton: 32,
+        refresh: 20,
+        warning: 48,
+        close: 32
+      };
+    }
+
+    return {
+      actionCard: 40 * editorScale,
+      actionButton: 40 * editorScale,
+      refresh: 24 * editorScale,
+      warning: 64 * editorScale,
+      close: 40 * editorScale
+    };
+  }, [editorScale, editorViewport.isMobile]);
+  const showPreviewLoader =
+    !cropEditor &&
+    (isGenerating || (showResultView ? !resultLoaded : Boolean(previewUrl) && !previewLoaded));
+  const showCropLoader = Boolean(cropEditor) && !cropMediaSize;
+  const createButtonTone = getEditorActionTone(canGenerate);
+  const downloadButtonTone = getEditorActionTone(Boolean(resultUrl) && resultLoaded && !isGenerating);
   const cropBoxStyle = useMemo(() => {
     if (!cropEditor) return undefined;
     return {
@@ -1105,139 +1403,137 @@ export default function TemplateEditorPage({
   );
 
   return (
-    <main className="screen-page screen-page--editor">
+    <main
+      className={`screen-page screen-page--editor${editorViewport.isMobile ? " is-mobile" : ""}`}
+      style={editorRootStyle}
+    >
+      <h1 className="visually-hidden">{templateName}</h1>
       <div className="screen-card screen-card--editor">
         <section className="editor-form">
-          <div className="editor-form__header">
-            <h1 className="screen-title screen-title--editor">{templateName}</h1>
-            {status ? <p className="editor-inline-note">{status}</p> : null}
-            {error ? <p className="editor-inline-note editor-inline-note--error">{error.message}</p> : null}
-            {loadingSchema ? <p className="editor-inline-note">Загрузка...</p> : null}
-          </div>
-
           <div className="editor-form__body ui-scroll">
-            {textFields.map((field) => (
-              <div key={field.key} className="field-block editor-field-block">
-                <div className="text-field-header">
-                  <label htmlFor={field.key}>{field.label}</label>
-                  <div className="size-adjust" role="radiogroup" aria-label={`Размер текста ${field.label}`}>
-                    <span className="size-adjust-line" />
-                    {([-1, 0, 1] as const).map((value) => {
-                      const current = textSizeAdjust[field.key] ?? 0;
-                      const isActive = current === value;
-                      const title = value === -1 ? "-10pt" : value === 1 ? "+10pt" : "0";
-                      const marker = value === -1 ? "-" : value === 1 ? "+" : "";
-                      return (
-                        <button
-                          key={`${field.key}:${value}`}
-                          type="button"
-                          className={`size-adjust-dot${isActive ? " is-active" : ""}`}
-                          aria-label={`${field.label}: ${title}`}
-                          aria-pressed={isActive}
-                          onClick={() =>
+            {schemaFields.map((field) => {
+              const displayLabel = displayFieldLabels[field.key] ?? field.label;
+
+              if (field.type === "text") {
+                const isRichTextField = field.key === RICH_TEXT_FIELD_KEY;
+                const isMultiline = isMultilineTextField(field);
+                const sizeValue = textSizeAdjust[field.key] ?? 0;
+
+                return (
+                  <section key={field.key} className="editor-block editor-block--text">
+                    <h2 className="editor-block__title">{displayLabel}</h2>
+                    <div className="editor-text-layout">
+                      <div className="editor-text-layout__field">
+                        {isRichTextField ? (
+                          <RichColorTextField
+                            ref={richTextFieldRef}
+                            id={field.key}
+                            segments={richTextFieldSegments}
+                            defaultColor={richTextDefaultColor}
+                            disabled={isGenerating}
+                            onChangeSegments={handleRichTextSegmentsChange}
+                          />
+                        ) : (
+                          <textarea
+                            id={field.key}
+                            rows={isMultiline ? 4 : 1}
+                            className={`editor-text-input${isMultiline ? " is-multiline" : " is-single-line"}`}
+                            value={fields[field.key] ?? ""}
+                            disabled={isGenerating}
+                            onChange={(event) =>
+                              setFields((prev) => ({
+                                ...prev,
+                                [field.key]: event.target.value
+                              }))
+                            }
+                          />
+                        )}
+                      </div>
+
+                      <div className="editor-text-controls" aria-label={`Панель управления ${displayLabel}`}>
+                        <TextSizeControl
+                          fieldLabel={displayLabel}
+                          value={sizeValue}
+                          disabled={isGenerating}
+                          onChange={(next) =>
                             setTextSizeAdjust((prev) => ({
                               ...prev,
-                              [field.key]: value
+                              [field.key]: next
                             }))
                           }
-                        >
-                          {marker}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-                {field.key === RICH_TEXT_FIELD_KEY ? (
-                  <>
-                    <RichColorTextField
-                      ref={richTextFieldRef}
-                      id={field.key}
-                      segments={richTextFieldSegments}
-                      defaultColor={richTextDefaultColor}
-                      disabled={isGenerating}
-                      onChangeSegments={handleRichTextSegmentsChange}
-                    />
-                    <div className="rich-text-color-picker" role="group" aria-label="Цвет выделенного текста">
-                      {RICH_TEXT_COLORS.map((color) => (
-                        <button
-                          key={color}
-                          type="button"
-                          className="rich-text-color-dot"
-                          style={{ backgroundColor: color }}
-                          aria-label={`Цвет ${color}`}
-                          onClick={() => {
-                            richTextFieldRef.current?.applyColorToSelection(color);
-                          }}
-                          disabled={isGenerating}
                         />
-                      ))}
+                        {isRichTextField ? (
+                          <TextColorControl
+                            disabled={isGenerating}
+                            onSelectColor={(color) => {
+                              richTextFieldRef.current?.applyColorToSelection(color);
+                            }}
+                          />
+                        ) : null}
+                      </div>
                     </div>
-                  </>
-                ) : (
-                  <textarea
-                    id={field.key}
-                    rows={4}
-                    value={fields[field.key] ?? ""}
-                    onChange={(event) =>
-                      setFields((prev) => ({
-                        ...prev,
-                        [field.key]: event.target.value
-                      }))
-                    }
-                  />
-                )}
-              </div>
-            ))}
+                  </section>
+                );
+              }
 
-            {imageFields.map((field) => {
               const selection = photoSelections[field.key] ?? null;
-              const hasPhoto = Boolean(selection);
               const localPreview = localPreviewUrls[field.key];
-              const previewSrc =
-                selection && selection.source === "photobank" ? selection.previewUrl : selection && selection.source === "local" ? localPreview : "";
+              const uploadPreview = selection && selection.source === "local" ? localPreview : undefined;
+              const photobankPreview = selection && selection.source === "photobank" ? selection.previewUrl : undefined;
+              const hasPhoto = Boolean(selection);
 
               return (
-                <div key={field.key} className="field-block editor-field-block">
-                  <label>{field.label}</label>
-                  <div className="row">
+                <section key={field.key} className="editor-block editor-block--photo">
+                  <div className="editor-photo-header">
+                    <h2 className="editor-block__title">{displayLabel}</h2>
                     <button
                       type="button"
-                      onClick={() => fileInputRefs.current[field.key]?.click()}
+                      className="editor-photo-refresh"
+                      aria-label={`Сбросить ${displayLabel}`}
+                      onClick={() => {
+                        setPhotoSelections((prev) => ({
+                          ...prev,
+                          [field.key]: null
+                        }));
+                        setPhotoEdits((prev) => {
+                          const next = { ...prev };
+                          delete next[field.key];
+                          return next;
+                        });
+                        closeCropEditor();
+                        setStatus("");
+                      }}
                       disabled={isGenerating}
                     >
-                      Загрузить
+                      <AppIcon name={EDITOR_ICON_MAP.refresh} tone="red" size={iconSizes.refresh} />
                     </button>
-                    <button type="button" onClick={() => void openPhotobankForField(field.key)} disabled={isGenerating}>
-                      Фотобанк
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void openCropEditor(field.key)}
+                  </div>
+
+                  <div className="editor-photo-actions">
+                    <PhotoSelectCard
+                      label="Загрузить"
+                      icon={EDITOR_ICON_MAP.upload}
+                      previewSrc={uploadPreview}
+                      iconSize={iconSizes.actionCard}
+                      disabled={isGenerating}
+                      onClick={() => fileInputRefs.current[field.key]?.click()}
+                    />
+                    <PhotoSelectCard
+                      label="Фотобанк"
+                      icon={EDITOR_ICON_MAP.photobank}
+                      previewSrc={photobankPreview}
+                      iconSize={iconSizes.actionCard}
+                      disabled={isGenerating}
+                      onClick={() => void openPhotobankForField(field.key)}
+                    />
+                    <EditorActionButton
+                      label="Обрезать"
+                      icon={EDITOR_ICON_MAP.crop}
+                      tone={getEditorActionTone(hasPhoto)}
+                      iconSize={iconSizes.actionButton}
                       disabled={isGenerating || !hasPhoto}
-                    >
-                      Обрезать фото
-                    </button>
-                    {hasPhoto ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setPhotoSelections((prev) => ({
-                            ...prev,
-                            [field.key]: null
-                          }));
-                          setPhotoEdits((prev) => {
-                            const next = { ...prev };
-                            delete next[field.key];
-                            return next;
-                          });
-                          closeCropEditor();
-                          setStatus("");
-                        }}
-                        disabled={isGenerating}
-                      >
-                        Сбросить
-                      </button>
-                    ) : null}
+                      onClick={() => void openCropEditor(field.key)}
+                    />
                   </div>
 
                   <input
@@ -1245,9 +1541,9 @@ export default function TemplateEditorPage({
                       fileInputRefs.current[field.key] = node;
                     }}
                     id={`upload-${field.key}`}
+                    className="visually-hidden"
                     type="file"
                     accept="image/jpeg,image/png,image/webp"
-                    style={{ display: "none" }}
                     onChange={(event) => {
                       const file = event.target.files?.[0] ?? null;
                       setPhotoSelections((prev) => ({
@@ -1264,19 +1560,7 @@ export default function TemplateEditorPage({
                       event.currentTarget.value = "";
                     }}
                   />
-
-                  <p className="muted">
-                    {!selection
-                      ? "Фото не выбрано"
-                      : "Фото выбрано"}
-                  </p>
-
-                  {previewSrc ? (
-                    <div className="selected-photo-preview-wrap">
-                      <img src={previewSrc} alt={field.label} className="selected-photo-preview" />
-                    </div>
-                  ) : null}
-                </div>
+                </section>
               );
             })}
           </div>
@@ -1285,132 +1569,154 @@ export default function TemplateEditorPage({
         <aside className="editor-preview">
           <div className="editor-preview__shell">
             {cropEditor ? (
-              <div className="editor-preview__crop-wrap">
-                <p className="editor-inline-note">Обрезка фото: {cropFieldLabel}</p>
-                <div className="result-preview-wrap result-preview-wrap--editor">
-                  <div className="crop-stage">
-                    <div
-                      className="crop-preview-wrap"
-                      ref={cropPreviewWrapRef}
-                      style={{ aspectRatio: `${cropEditor.frameWidth} / ${cropEditor.frameHeight}` }}
-                    >
-                      {cropEditor.previewUrl ? (
-                        <img src={cropEditor.previewUrl} alt="Template preview" className="crop-stage-preview" />
-                      ) : null}
+              <div className={`editor-preview-stage editor-preview-stage--crop${showCropLoader ? " is-loading" : ""}`}>
+                <div className="editor-preview-stage__canvas">
+                  <div className="result-preview-wrap result-preview-wrap--editor">
+                    <div className="crop-stage">
                       <div
-                        className="crop-area-container"
-                        style={cropBoxStyle}
-                        ref={(node) => {
-                          cropAreaRef.current = node;
-                          cropperContainerRef.current = node;
-                        }}
+                        className="crop-preview-wrap"
+                        ref={cropPreviewWrapRef}
+                        style={{ aspectRatio: `${cropEditor.frameWidth} / ${cropEditor.frameHeight}` }}
                       >
-                        <div className="cropper-host">
-                          <Cropper
-                            image={cropEditor.imageUrl}
-                            crop={cropEditor.crop}
-                            zoom={cropEditor.zoom}
-                            aspect={cropEditor.photoBox.width / cropEditor.photoBox.height}
-                            cropSize={
-                              cropAreaSize.width > 0 && cropAreaSize.height > 0
-                                ? { width: cropAreaSize.width, height: cropAreaSize.height }
-                                : undefined
-                            }
-                            onCropChange={(nextCrop) =>
-                              setCropEditor((prev) => (prev ? { ...prev, crop: nextCrop } : prev))
-                            }
-                            onZoomChange={(nextZoom) =>
-                              setCropEditor((prev) => (prev ? { ...prev, zoom: Math.max(0.1, Math.min(8, nextZoom)) } : prev))
-                            }
-                            onMediaLoaded={(media) => {
-                              if (!media || !Number.isFinite(media.width) || !Number.isFinite(media.height)) return;
-                              setCropMediaSize({
-                                width: media.width,
-                                height: media.height
-                              });
-                            }}
-                            onCropComplete={(_croppedArea: Area, croppedAreaPixels: Area) => {
-                              setCropEditor((prev) => {
-                                if (!prev) return prev;
-                                return {
-                                  ...prev,
-                                  cropNorm: {
-                                    x: clamp01(croppedAreaPixels.x / prev.imageNaturalWidth),
-                                    y: clamp01(croppedAreaPixels.y / prev.imageNaturalHeight),
-                                    w: clamp01(croppedAreaPixels.width / prev.imageNaturalWidth),
-                                    h: clamp01(croppedAreaPixels.height / prev.imageNaturalHeight)
-                                  }
-                                };
-                              });
-                            }}
-                            objectFit="contain"
-                            showGrid={false}
-                            zoomWithScroll={false}
-                            restrictPosition={false}
-                            style={{
-                              containerStyle: {
-                                width: "100%",
-                                height: "100%",
-                                position: "absolute",
-                                inset: "0",
-                                overflow: "visible"
-                              },
-                              cropAreaStyle: {
-                                width: "100%",
-                                height: "100%"
+                        {cropEditor.previewUrl ? (
+                          <img src={cropEditor.previewUrl} alt="" className="crop-stage-preview" />
+                        ) : null}
+                        <div
+                          className="crop-area-container"
+                          style={cropBoxStyle}
+                          ref={(node) => {
+                            cropAreaRef.current = node;
+                            cropperContainerRef.current = node;
+                          }}
+                        >
+                          <div className="cropper-host">
+                            <Cropper
+                              image={cropEditor.imageUrl}
+                              crop={cropEditor.crop}
+                              zoom={cropEditor.zoom}
+                              aspect={cropEditor.photoBox.width / cropEditor.photoBox.height}
+                              cropSize={
+                                cropAreaSize.width > 0 && cropAreaSize.height > 0
+                                  ? { width: cropAreaSize.width, height: cropAreaSize.height }
+                                  : undefined
                               }
-                            }}
-                          />
-                        </div>
-                        <div className="crop-handles-layer" aria-hidden="true">
-                          {resizeHandles.map((handle) => (
-                            <button
-                              key={handle.key}
-                              type="button"
-                              className="crop-handle"
-                              data-handle={handle.key}
-                              style={{
-                                left: `${handle.x}px`,
-                                top: `${handle.y}px`,
-                                cursor: handle.cursor
+                              onCropChange={(nextCrop) =>
+                                setCropEditor((prev) => (prev ? { ...prev, crop: nextCrop } : prev))
+                              }
+                              onZoomChange={(nextZoom) =>
+                                setCropEditor((prev) =>
+                                  prev ? { ...prev, zoom: Math.max(0.1, Math.min(8, nextZoom)) } : prev
+                                )
+                              }
+                              onMediaLoaded={(media) => {
+                                if (!media || !Number.isFinite(media.width) || !Number.isFinite(media.height)) return;
+                                setCropMediaSize({
+                                  width: media.width,
+                                  height: media.height
+                                });
                               }}
-                              onPointerDown={onResizeHandlePointerDown}
-                              aria-label="Изменить масштаб"
+                              onCropComplete={(_croppedArea: Area, croppedAreaPixels: Area) => {
+                                setCropEditor((prev) => {
+                                  if (!prev) return prev;
+                                  return {
+                                    ...prev,
+                                    cropNorm: {
+                                      x: clamp01(croppedAreaPixels.x / prev.imageNaturalWidth),
+                                      y: clamp01(croppedAreaPixels.y / prev.imageNaturalHeight),
+                                      w: clamp01(croppedAreaPixels.width / prev.imageNaturalWidth),
+                                      h: clamp01(croppedAreaPixels.height / prev.imageNaturalHeight)
+                                    }
+                                  };
+                                });
+                              }}
+                              objectFit="contain"
+                              showGrid={false}
+                              zoomWithScroll={false}
+                              restrictPosition={false}
+                              style={{
+                                containerStyle: {
+                                  width: "100%",
+                                  height: "100%",
+                                  position: "absolute",
+                                  inset: "0",
+                                  overflow: "visible"
+                                },
+                                cropAreaStyle: {
+                                  width: "100%",
+                                  height: "100%"
+                                }
+                              }}
                             />
-                          ))}
+                          </div>
+                          <div className="crop-handles-layer" aria-hidden="true">
+                            {resizeHandles.map((handle) => (
+                              <button
+                                key={handle.key}
+                                type="button"
+                                className="crop-handle"
+                                data-handle={handle.key}
+                                style={{
+                                  left: `${handle.x}px`,
+                                  top: `${handle.y}px`,
+                                  cursor: handle.cursor
+                                }}
+                                onPointerDown={onResizeHandlePointerDown}
+                                aria-label="Изменить масштаб"
+                              />
+                            ))}
+                          </div>
                         </div>
                       </div>
                     </div>
                   </div>
                 </div>
+                {showCropLoader ? (
+                  <div className="editor-preview-stage__loader" role="status" aria-live="polite">
+                    <LoadingMark className="editor-preview-stage__mark" />
+                  </div>
+                ) : null}
               </div>
             ) : (
-              <div className="result-preview-wrap result-preview-wrap--editor" aria-busy={isGenerating || (Boolean(resultUrl) && !resultLoaded)}>
-                {showResultView ? (
-                  <div className="result-preview-stack">
-                    <img
-                      src={resultUrl ?? ""}
-                      alt="Готовый макет"
-                      className="result-preview-image"
-                      onLoad={() => setResultLoaded(true)}
-                      onError={() => {
-                        const friendly = asUiError("E_RESULT_LOAD_FAILED", "Не удалось загрузить созданный макет");
-                        setError(friendly);
-                        setStatus(friendly.message);
-                        setResultLoaded(false);
-                        setResultUrl(null);
-                      }}
-                      style={{ opacity: resultLoaded ? 1 : 0 }}
-                    />
-                  </div>
-                ) : previewUrl ? (
-                  <img src={previewUrl} alt="Preview template" className="result-preview-image" />
-                ) : (
-                  <div className="result-preview-empty muted">Preview unavailable</div>
-                )}
-                {isGenerating || (Boolean(resultUrl) && !resultLoaded) ? (
-                  <div className="result-preview-loader" role="status" aria-live="polite">
-                    <span className="result-preview-spinner" />
+              <div className={`editor-preview-stage${showPreviewLoader ? " is-loading" : ""}`} aria-busy={showPreviewLoader}>
+                <div className="editor-preview-stage__canvas">
+                  {showResultView ? (
+                    <div className="result-preview-wrap result-preview-wrap--editor result-preview-stack">
+                      <img
+                        src={resultUrl ?? ""}
+                        alt="Готовый макет"
+                        className="result-preview-image editor-preview-media"
+                        onLoad={() => setResultLoaded(true)}
+                        onError={() => {
+                          const friendly = asUiError("E_RESULT_LOAD_FAILED", "Не удалось загрузить созданный макет");
+                          setError(friendly);
+                          setStatus(friendly.message);
+                          setResultLoaded(false);
+                          setResultUrl(null);
+                        }}
+                        style={{ opacity: resultLoaded ? 1 : 0 }}
+                      />
+                    </div>
+                  ) : previewUrl ? (
+                    <div className="result-preview-wrap result-preview-wrap--editor">
+                      <img
+                        src={previewUrl}
+                        alt=""
+                        className="result-preview-image editor-preview-media"
+                        onLoad={() => setPreviewLoaded(true)}
+                        onError={() => {
+                          setPreviewLoaded(true);
+                          setPreviewUrl(null);
+                        }}
+                        style={{ opacity: previewLoaded ? 1 : 0 }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="editor-preview-empty" aria-hidden="true" />
+                  )}
+                </div>
+                {showPreviewLoader ? (
+                  <div className="editor-preview-stage__loader" role="status" aria-live="polite">
+                    <LoadingMark className="editor-preview-stage__mark" />
                   </div>
                 ) : null}
               </div>
@@ -1420,28 +1726,57 @@ export default function TemplateEditorPage({
           <div className="editor-action-row">
             {cropEditor ? (
               <>
-                <button type="button" onClick={() => confirmCropEditor()} disabled={!cropEditor.cropNorm}>
-                  Подтвердить
-                </button>
-                <button type="button" onClick={() => cancelCropEditor()}>
-                  Отмена
-                </button>
+                <EditorActionButton
+                  label="Подтвердить"
+                  icon={EDITOR_ICON_MAP.confirm}
+                  tone="primary"
+                  iconSize={iconSizes.actionButton}
+                  disabled={!cropEditor.cropNorm}
+                  onClick={() => confirmCropEditor()}
+                />
+                <EditorActionButton
+                  label="Отмена"
+                  icon={EDITOR_ICON_MAP.cancel}
+                  tone="primary"
+                  iconSize={iconSizes.actionButton}
+                  onClick={() => cancelCropEditor()}
+                />
               </>
             ) : (
               <>
-                <button type="button" onClick={() => void handleGenerate()} disabled={!canGenerate}>
-                  {isGenerating ? "Создание..." : "Создать изображение"}
-                </button>
+                <EditorActionButton
+                  label="Создать"
+                  icon={EDITOR_ICON_MAP.create}
+                  tone={createButtonTone}
+                  iconSize={iconSizes.actionButton}
+                  disabled={!canGenerate}
+                  onClick={() => void handleGenerate()}
+                />
                 {resultUrl ? (
-                  <button type="button" onClick={() => window.open(resultUrl, "_blank", "noopener,noreferrer")}>
-                    Скачать
-                  </button>
+                  <EditorActionButton
+                    label="Скачать"
+                    icon={EDITOR_ICON_MAP.download}
+                    tone={downloadButtonTone}
+                    iconSize={iconSizes.actionButton}
+                    disabled={!resultLoaded || isGenerating}
+                    onClick={() => window.open(resultUrl, "_blank", "noopener,noreferrer")}
+                  />
                 ) : null}
               </>
             )}
           </div>
         </aside>
       </div>
+
+      {loadingSchema ? (
+        <div className="editor-overlay" role="status" aria-live="polite" aria-label="Загрузка страницы шаблона">
+          <div className="loading-card">
+            <LoadingMark />
+          </div>
+        </div>
+      ) : null}
+
+      {error ? <EditorWarningModal error={error} iconSizes={iconSizes} onClose={() => setError(null)} /> : null}
 
       {photobankOpen ? (
         <div className="modal-backdrop" onClick={() => setPhotobankOpen(false)}>
